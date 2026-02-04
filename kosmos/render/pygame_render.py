@@ -8,7 +8,9 @@ from typing import Optional
 from ..world.grid import KosmosWorld
 from ..world.objects import (
     Biome, BIOME_COLORS, Food, Water, Hazard, CraftItem, WorldObject,
+    Herb, Seed, PlantedCrop,
 )
+from ..world.weather import WeatherType
 from ..agent.core import KosmosAgent
 
 
@@ -27,6 +29,22 @@ STRATEGY_COLORS = {
     "rest": (100, 180, 100),
     "learn": (180, 120, 220),
     "social": (220, 120, 160),
+}
+
+GOAL_COLORS = {
+    "explore_space": (80, 180, 220),
+    "seek_food": (220, 160, 40),
+    "find_shelter": (100, 160, 100),
+    "rest_recover": (100, 180, 100),
+    "manipulate_objects": (180, 160, 100),
+    "social_interact": (220, 120, 160),
+    "categorize_experience": (180, 120, 220),
+}
+
+DECISION_COLORS = {
+    "teacher_llm": (80, 160, 80),
+    "teacher_heuristic": (160, 160, 80),
+    "learned": (120, 80, 220),
 }
 
 AGENT_COLOR = (240, 220, 60)
@@ -190,8 +208,24 @@ class KosmosRenderer:
         self._draw_narration()
 
     def _draw_grid(self):
-        """Draw biome-colored grid."""
+        """Draw biome-colored grid with weather tinting."""
         cs = self.cell_size
+        # Weather tint
+        w = self.world.weather.current
+        tint = None
+        if w and w.active:
+            t = w.intensity
+            if w.weather_type == WeatherType.RAIN:
+                tint = (0, int(10 * t), int(20 * t))
+            elif w.weather_type == WeatherType.STORM:
+                tint = (int(-15 * t), int(-15 * t), int(-10 * t))
+            elif w.weather_type == WeatherType.HEAT_WAVE:
+                tint = (int(15 * t), int(5 * t), int(-5 * t))
+            elif w.weather_type == WeatherType.FOG:
+                tint = (int(10 * t), int(10 * t), int(12 * t))
+            elif w.weather_type == WeatherType.WIND:
+                tint = (0, 0, 0)  # no visual tint for wind
+
         for r in range(self.world.size):
             for c in range(self.world.size):
                 biome = self.world.biomes[r, c]
@@ -199,6 +233,9 @@ class KosmosRenderer:
                 # Night dimming
                 if self.world.is_night:
                     color = tuple(max(0, int(v * 0.5)) for v in color)
+                # Weather tinting
+                if tint:
+                    color = tuple(max(0, min(255, color[i] + tint[i])) for i in range(3))
                 rect = pygame.Rect(c * cs, r * cs, cs, cs)
                 pygame.draw.rect(self.screen, color, rect)
                 pygame.draw.rect(self.screen, GRID_LINE, rect, 1)
@@ -230,6 +267,11 @@ class KosmosRenderer:
                     pygame.draw.line(self.screen, color,
                                     (cx + radius, cy - radius),
                                     (cx - radius, cy + radius), 2)
+                elif isinstance(obj, PlantedCrop):
+                    # Growing plant: upward triangle
+                    pts = [(cx, cy - radius), (cx + radius, cy + radius),
+                           (cx - radius, cy + radius)]
+                    pygame.draw.polygon(self.screen, color, pts)
                 elif isinstance(obj, CraftItem):
                     # Plus
                     pygame.draw.line(self.screen, color,
@@ -305,13 +347,37 @@ class KosmosRenderer:
         self._text(panel_x, y, f"Strategy: {strat}", self.font_md, strat_color)
         y += 18
 
+        # Embodied Goal (L2)
+        goal = state.get("embodied_goal", "")
+        goal_color = GOAL_COLORS.get(goal, TEXT_DIM)
+        self._text(panel_x, y, f"Goal: {goal}", self.font_sm, goal_color)
+        y += 15
+
+        # Decision source
+        source = state.get("decision_source", "teacher")
+        src_color = DECISION_COLORS.get(source, TEXT_DIM)
+        self._text(panel_x, y, f"Deciding: {source}", self.font_sm, src_color)
+        y += 16
+
         # Context
         self._text(panel_x, y, f"Context: {state['context']}", self.font_sm, TEXT_DIM)
         y += 16
 
-        # Time
+        # Time + Weather
+        weather = state.get("weather", "clear")
+        weather_colors = {
+            "rain": (80, 140, 220),
+            "storm": (200, 80, 80),
+            "heat_wave": (220, 160, 40),
+            "fog": (160, 160, 170),
+            "wind": (140, 200, 180),
+            "clear": TEXT_DIM,
+        }
         self._text(panel_x, y, f"{state['time_of_day']} | {state['season']}",
                    self.font_sm, TEXT_DIM)
+        y += 15
+        w_color = weather_colors.get(weather, TEXT_DIM)
+        self._text(panel_x, y, f"Weather: {weather}", self.font_sm, w_color)
         y += 20
 
         # Energy bar
@@ -327,6 +393,12 @@ class KosmosRenderer:
         # Entropy bar
         self._draw_bar(panel_x, y, "Entropy", state["entropy"],
                        (180, 120, 220), (60, 60, 80))
+        y += 22
+
+        # Teacher probability bar
+        teacher_prob = state.get("teacher_prob", 1.0)
+        self._draw_bar(panel_x, y, "Teacher", teacher_prob,
+                       (180, 160, 80), (120, 80, 220))
         y += 22
 
         # LLM temp
@@ -349,6 +421,20 @@ class KosmosRenderer:
         ]
         for s in stats:
             self._text(panel_x, y, s, self.font_sm, TEXT_DIM)
+            y += 14
+
+        # Learning stats
+        learned_samples = state.get("learned_samples", 0)
+        if learned_samples > 0:
+            learned_ema = state.get("learned_ema", 0.0)
+            heuristic_ema = state.get("heuristic_ema", 0.0)
+            self._text(panel_x, y,
+                       f"L:{learned_samples} T:{teacher_prob:.2f}",
+                       self.font_sm, TEXT_DIM)
+            y += 14
+            self._text(panel_x, y,
+                       f"L_ema:{learned_ema:.3f} H_ema:{heuristic_ema:.3f}",
+                       self.font_sm, TEXT_DIM)
             y += 14
 
         y += 8

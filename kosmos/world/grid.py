@@ -4,7 +4,15 @@ import numpy as np
 from typing import Optional
 from .objects import (
     Biome, BIOME_MOVE_COST, Food, Water, Hazard, CraftItem, WorldObject,
+    Herb, Seed, PlantedCrop,
 )
+from .weather import WeatherManager, WeatherType
+
+_OPPOSITES = {"north": "south", "south": "north", "east": "west", "west": "east"}
+
+
+def _opposite_dir(d: str) -> str:
+    return _OPPOSITES.get(d, "")
 
 
 class KosmosWorld:
@@ -32,6 +40,9 @@ class KosmosWorld:
         self.tick_count = 0
         self.day_length = 200        # ticks per day
         self.season_length = 800     # ticks per season
+
+        # Weather system
+        self.weather = WeatherManager(self.rng)
 
         # Event log (renderer reads this)
         self.events: list[dict] = []
@@ -106,6 +117,16 @@ class KosmosWorld:
             pos = self._random_pos()
             self._add_object(CraftItem(position=pos), pos)
 
+        # Herbs: ~2%, biased toward forest
+        for _ in range(int(n * 0.02)):
+            pos = self._random_pos(prefer=[Biome.FOREST])
+            self._add_object(Herb(position=pos), pos)
+
+        # Seeds: ~1%, biased toward plains/forest
+        for _ in range(int(n * 0.01)):
+            pos = self._random_pos(prefer=[Biome.PLAINS, Biome.FOREST])
+            self._add_object(Seed(position=pos), pos)
+
     def _random_pos(self, prefer: list[Biome] | None = None) -> tuple:
         """Pick a random position, optionally biased toward certain biomes."""
         for _ in range(20):
@@ -129,6 +150,9 @@ class KosmosWorld:
         self.tick_count += 1
         self.events.clear()
 
+        # Weather update
+        self.weather.tick()
+
         # Seasonal modulation of spawn rates
         _season_mods = {
             "spring": (1.0, 1.0, 1.0),    # (food_target, food_prob, hazard_prob)
@@ -137,6 +161,14 @@ class KosmosWorld:
             "winter": (0.5, 0.5, 1.5),
         }
         ft_mod, fp_mod, hp_mod = _season_mods.get(self.season, (1.0, 1.0, 1.0))
+
+        # Weather modifiers on spawning
+        w = self.weather.current
+        water_spawn_mod = 1.0
+        if w and w.weather_type == WeatherType.RAIN:
+            water_spawn_mod = 2.0 * w.intensity
+        if w and w.weather_type == WeatherType.STORM:
+            hp_mod *= 1.0 + 0.5 * w.intensity
 
         # Decay existing objects
         to_remove = []
@@ -156,6 +188,17 @@ class KosmosWorld:
         for pos in to_remove:
             del self.objects[pos]
 
+        # Mature crops become food
+        for pos in list(self.objects.keys()):
+            objs = self.objects.get(pos, [])
+            for obj in list(objs):
+                if isinstance(obj, PlantedCrop) and obj.is_mature:
+                    objs.remove(obj)
+                    self._add_object(Food(position=pos), pos)
+                    self.events.append({
+                        "type": "harvest", "object": "crop", "position": pos
+                    })
+
         # Spawn new food (migration — never in same spot)
         food_count = sum(
             1 for objs in self.objects.values()
@@ -172,6 +215,11 @@ class KosmosWorld:
                     "type": "spawn", "object": "food", "position": pos
                 })
 
+        # Occasional water spawns (boosted by rain)
+        if self.rng.random() < 0.02 * water_spawn_mod:
+            pos = self._random_pos(prefer=[Biome.WATER, Biome.FOREST])
+            self._add_object(Water(position=pos), pos)
+
         # Occasional hazard spawns
         if self.rng.random() < 0.02 * hp_mod:
             pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
@@ -181,6 +229,11 @@ class KosmosWorld:
         if self.rng.random() < 0.03:
             pos = self._random_pos()
             self._add_object(CraftItem(position=pos), pos)
+
+        # Occasional herb spawns
+        if self.rng.random() < 0.01:
+            pos = self._random_pos(prefer=[Biome.FOREST])
+            self._add_object(Herb(position=pos), pos)
 
     # ------------------------------------------------------------------ #
     #  Queries                                                             #
@@ -203,14 +256,35 @@ class KosmosWorld:
         results.sort(key=lambda x: x[0])
         return results
 
-    def move_cost(self, pos: tuple) -> float:
+    def move_cost(self, pos: tuple, direction: str = "") -> float:
         """Energy cost to enter this cell."""
         biome = self.biomes[pos[0] % self.size, pos[1] % self.size]
         base = BIOME_MOVE_COST.get(biome, 1.0)
         # Night penalty
         if self.is_night:
             base *= 1.4
+        # Weather effects
+        w = self.weather.current
+        if w:
+            if w.weather_type == WeatherType.RAIN:
+                base *= 1.0 + 0.3 * w.intensity
+            elif w.weather_type == WeatherType.WIND and direction:
+                if direction == w.wind_direction:
+                    base *= 0.7  # wind at your back
+                elif direction == _opposite_dir(w.wind_direction):
+                    base *= 1.0 + 0.5 * w.intensity  # headwind
         return base * 0.008
+
+    @property
+    def weather_name(self) -> str:
+        return self.weather.weather_name
+
+    @property
+    def examine_radius(self) -> int:
+        w = self.weather.current
+        if w and w.weather_type == WeatherType.FOG:
+            return 2
+        return 4
 
     @property
     def is_night(self) -> bool:

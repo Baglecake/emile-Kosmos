@@ -2,10 +2,41 @@
 
 import json
 import threading
+from collections import deque
 import requests
 from typing import Optional
 
 OLLAMA_URL = "http://localhost:11434"
+
+
+class ConversationHistory:
+    """Sliding window of recent exchanges for multi-turn context."""
+
+    def __init__(self, max_turns: int = 4, max_chars: int = 3000):
+        self._turns: deque[dict] = deque(maxlen=max_turns * 2)
+        self.max_chars = max_chars
+
+    def add_user(self, content: str):
+        self._turns.append({"role": "user", "content": content})
+        self._trim()
+
+    def add_assistant(self, content: str):
+        self._turns.append({"role": "assistant", "content": content})
+        self._trim()
+
+    def get_messages(self) -> list[dict]:
+        return list(self._turns)
+
+    def clear(self):
+        self._turns.clear()
+
+    def _trim(self):
+        """Drop oldest turns if total character count exceeds limit."""
+        while len(self._turns) > 2:
+            total = sum(len(t["content"]) for t in self._turns)
+            if total <= self.max_chars:
+                break
+            self._turns.popleft()
 
 
 class OllamaReasoner:
@@ -20,6 +51,7 @@ class OllamaReasoner:
         self.model = model
         self._lock = threading.Lock()
         self._available = None
+        self.history = ConversationHistory(max_turns=4)
 
     def check_available(self) -> bool:
         """Check if Ollama is running and model is available."""
@@ -50,6 +82,7 @@ class OllamaReasoner:
         energy: float,
         inventory: list[str],
         memory_hits: list[str] | None = None,
+        last_result: str = "",
     ) -> dict:
         """
         Ask the LLM to decide what to do.
@@ -88,10 +121,18 @@ class OllamaReasoner:
             f"Pick the single best action for your current situation."
         )
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": situation},
-        ]
+        # Build multi-turn message list
+        user_content = situation
+        if last_result:
+            user_content = f"Previous action result: {last_result}\n\n{situation}"
+
+        messages = [{"role": "system", "content": system}]
+
+        # Insert conversation history between system and current turn
+        with self._lock:
+            history = self.history.get_messages()
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_content})
 
         try:
             resp = requests.post(
@@ -107,7 +148,15 @@ class OllamaReasoner:
             )
             resp.raise_for_status()
             content = resp.json().get("message", {}).get("content", "")
-            return self._parse_response(content)
+            parsed = self._parse_response(content)
+
+            # Only add to history if parse succeeded (not a fallback)
+            if parsed.get("tool") != "examine" or parsed.get("thought") != "Let me look around.":
+                with self._lock:
+                    self.history.add_user(user_content)
+                    self.history.add_assistant(content)
+
+            return parsed
         except requests.ConnectionError:
             return self._fallback(strategy, energy)
         except Exception:

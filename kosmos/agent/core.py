@@ -7,14 +7,18 @@ from typing import Optional
 
 from emile_mini import EmileAgent, QSEConfig
 from emile_mini.goal_v2 import GoalModuleV2
+from emile_mini.goal_mapper import GoalMapper
 
 from ..world.grid import KosmosWorld
 from ..world.objects import (
     Food, Water, Hazard, CraftItem, CRAFT_RECIPES, Biome,
+    Herb, Seed, PlantedCrop,
 )
+from ..world.weather import WeatherType
 from ..tools.registry import ToolRegistry
 from ..tools.builtins import get_builtin_tools
 from ..llm.ollama import OllamaReasoner
+from .action_policy import KosmosActionPolicy, action_to_tool_call
 
 
 DIRECTIONS = {
@@ -96,9 +100,39 @@ class KosmosAgent:
         self.last_thought: str = ""
         self.last_narration: str = ""
 
+        # Layer 2: GoalMapper (strategy -> embodied goal)
+        if self.config.GOAL_MAPPER_LEARNED:
+            self.goal_mapper = GoalMapper(
+                alpha=0.15, gamma=0.8, lambda_trace=0.7,
+                epsilon_base=0.3, warm_start=True,
+            )
+        else:
+            self.goal_mapper = None
+        self.embodied_goal = "explore_space"
+
+        # Layer 3: KosmosActionPolicy (goal -> tool action)
+        if self.config.LEARNED_POLICY_ENABLED:
+            self.action_policy = KosmosActionPolicy(
+                hidden_dim=self.config.POLICY_HIDDEN_DIM,
+                lr=self.config.POLICY_LR,
+                gamma=self.config.POLICY_GAMMA,
+            )
+        else:
+            self.action_policy = None
+
+        # Teacher-student decay state
+        self._teacher_prob = 1.0
+        self._learned_reward_ema = 0.0
+        self._heuristic_reward_ema = 0.0
+        self._learned_samples = 0
+        self._used_learned = False
+        self._decision_source = "teacher"
+        self._policy_step_count = 0
+
         # Async LLM reasoning
-        self._llm_pending: Optional[dict] = None  # result from background LLM call
-        self._llm_busy = False  # True while a reasoning call is in flight
+        self._llm_pending: Optional[dict] = None
+        self._llm_busy = False
+        self._llm_pending_tick = 0
 
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
@@ -115,6 +149,7 @@ class KosmosAgent:
                 "rest": self._tool_rest,
                 "remember": self._tool_remember,
                 "wait": self._tool_wait,
+                "plant": self._tool_plant,
             }
             tool.fn = fn_map.get(tool.name)
             self.tools.register(tool)
@@ -134,8 +169,8 @@ class KosmosAgent:
         for obj in self.world.objects_at((nr, nc)):
             if obj.solid:
                 return f"Blocked by {obj.name}."
-        # Apply move cost (biome-dependent)
-        cost = self.world.move_cost((nr, nc))
+        # Apply move cost (biome-dependent, weather-aware)
+        cost = self.world.move_cost((nr, nc), direction=d)
         # Crafted axe reduces forest cost
         if "axe" in self.crafted:
             biome = self.world.biomes[nr, nc]
@@ -146,6 +181,9 @@ class KosmosAgent:
             biome = self.world.biomes[nr, nc]
             if biome == Biome.WATER:
                 cost *= 0.4
+        # Shelter frame reduces night penalty
+        if "shelter_frame" in self.crafted and self.world.is_night:
+            cost *= 0.7
         self.energy -= cost
         self.pos = (nr, nc)
         self.facing = d
@@ -167,7 +205,7 @@ class KosmosAgent:
 
     def _tool_examine(self, target: str = "surroundings") -> str:
         if target == "surroundings":
-            nearby = self.world.objects_near(self.pos, radius=4)
+            nearby = self.world.objects_near(self.pos, radius=self.world.examine_radius)
             biome = self.world.biomes[self.pos].value
             tod = self.world.time_of_day
             here = self.world.objects_at(self.pos)
@@ -197,7 +235,16 @@ class KosmosAgent:
                     return info
             return f"No '{target}' here."
 
+    @property
+    def inventory_capacity(self) -> int:
+        base = 6
+        if "basket" in self.crafted:
+            base = 10
+        return base
+
     def _tool_pickup(self, item: str = "") -> str:
+        if len(self.inventory) >= self.inventory_capacity:
+            return "Inventory full."
         for obj in self.world.objects_at(self.pos):
             if isinstance(obj, CraftItem) and item.lower() in obj.name.lower():
                 self.world.objects[self.pos].remove(obj)
@@ -214,10 +261,17 @@ class KosmosAgent:
                 self.world.objects[self.pos].remove(obj)
                 if not self.world.objects[self.pos]:
                     del self.world.objects[self.pos]
-                self.energy = min(1.0, self.energy + obj.energy_value)
+                energy_gain = obj.energy_value
+                # Flint enables cooking for better food value
+                if "flint" in self.crafted:
+                    energy_gain *= 1.3
+                self.energy = min(1.0, self.energy + energy_gain)
                 self.food_eaten += 1
+                extra = ""
+                if isinstance(obj, Herb) and hasattr(obj, 'heal_value'):
+                    extra = " Feeling better."
                 self._remember(f"Ate {obj.name} at {self.pos}, energy now {self.energy:.0%}.")
-                return f"Ate {obj.name}. Energy +{obj.energy_value:.0%} -> {self.energy:.0%}."
+                return f"Ate {obj.name}. Energy +{energy_gain:.0%} -> {self.energy:.0%}.{extra}"
             if isinstance(obj, Water) and item.lower() in obj.name.lower():
                 self.world.objects[self.pos].remove(obj)
                 if not self.world.objects[self.pos]:
@@ -267,6 +321,14 @@ class KosmosAgent:
             recovery = 0.05  # sheltered
         elif biome == Biome.DESERT:
             recovery = 0.01  # harsh
+        # Shelter frame bonus
+        if "shelter_frame" in self.crafted:
+            recovery *= 1.3
+        # Storm penalty if exposed
+        w = self.world.weather.current
+        if w and w.weather_type == WeatherType.STORM:
+            if biome in (Biome.PLAINS, Biome.DESERT):
+                recovery *= 0.3
         self.energy = min(1.0, self.energy + recovery)
         return f"Rested. Energy +{recovery:.0%} -> {self.energy:.0%}."
 
@@ -288,6 +350,16 @@ class KosmosAgent:
 
     def _tool_wait(self) -> str:
         return "Waited and observed."
+
+    def _tool_plant(self, item: str = "seed") -> str:
+        for i, obj in enumerate(self.inventory):
+            if isinstance(obj, Seed) or (isinstance(obj, CraftItem) and obj.craft_tag == "seed"):
+                self.inventory.remove(obj)
+                crop = PlantedCrop(position=self.pos)
+                self.world._add_object(crop, self.pos)
+                self._remember(f"Planted seed at {self.pos}.")
+                return f"Planted a seed at {self.pos}. It will grow into food."
+        return "No seeds to plant."
 
     def _remember(self, event: str):
         """Store a memory, keeping last 200."""
@@ -317,6 +389,63 @@ class KosmosAgent:
             time.sleep(0.05)
 
     # ------------------------------------------------------------------ #
+    #  Layer 2/3 helpers                                                   #
+    # ------------------------------------------------------------------ #
+    def _is_food_nearby(self) -> bool:
+        nearby = self.world.objects_near(self.pos, radius=3)
+        return any(isinstance(o, Food) for _, _, o in nearby)
+
+    def _is_shelter_nearby(self) -> bool:
+        if self.world.biomes[self.pos] == Biome.FOREST:
+            return True
+        r, c = self.pos
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self.world.size and 0 <= nc < self.world.size:
+                if self.world.biomes[nr, nc] == Biome.FOREST:
+                    return True
+        return False
+
+    def _build_policy_state_dict(self) -> dict:
+        nearby = self.world.objects_near(self.pos, radius=3)
+        near_food = sum(1 for d, _, o in nearby if isinstance(o, Food) and d > 0)
+        near_water = sum(1 for d, _, o in nearby if isinstance(o, Water) and d > 0)
+        near_hazard = sum(1 for d, _, o in nearby if isinstance(o, Hazard) and d > 0)
+        near_craft = sum(1 for d, _, o in nearby if isinstance(o, CraftItem) and d > 0)
+
+        here = self.world.objects_at(self.pos)
+        can_craft = False
+        for i, a in enumerate(self.inventory):
+            for b in self.inventory[i + 1:]:
+                key = tuple(sorted([a.craft_tag, b.craft_tag]))
+                if key in CRAFT_RECIPES:
+                    can_craft = True
+                    break
+            if can_craft:
+                break
+
+        return dict(
+            energy=self.energy,
+            hydration=self.hydration,
+            biome=self.world.biomes[self.pos].value,
+            time_of_day=self.world.time_of_day,
+            nearby_food=near_food,
+            nearby_water=near_water,
+            nearby_hazard=near_hazard,
+            nearby_craft=near_craft,
+            has_food_here=any(isinstance(o, Food) for o in here),
+            has_water_here=any(isinstance(o, Water) for o in here),
+            has_craft_here=any(isinstance(o, CraftItem) for o in here),
+            has_hazard_here=any(isinstance(o, Hazard) for o in here),
+            inventory_count=len(self.inventory),
+            can_craft=can_craft,
+            strategy=self.strategy,
+            goal=self.embodied_goal,
+            entropy=self.entropy,
+            surplus_mean=self.surplus_mean,
+        )
+
+    # ------------------------------------------------------------------ #
     #  Main tick: perceive -> think -> act                                 #
     # ------------------------------------------------------------------ #
     def tick(self) -> dict:
@@ -330,6 +459,16 @@ class KosmosAgent:
         self.energy -= 0.003
         self.hydration -= 0.001
 
+        # Weather effects on metabolism
+        w = self.world.weather.current
+        if w:
+            if w.weather_type == WeatherType.HEAT_WAVE:
+                self.energy -= 0.002 * w.intensity
+                self.hydration -= 0.002 * w.intensity
+            elif w.weather_type == WeatherType.STORM:
+                if self.world.biomes[self.pos] in (Biome.PLAINS, Biome.DESERT):
+                    self.energy -= 0.02 * w.intensity
+
         # Death check
         if self.energy <= 0:
             self.alive = False
@@ -337,6 +476,8 @@ class KosmosAgent:
             self._remember(f"Died of exhaustion at {self.pos}. Death #{self.deaths}.")
             self.last_action = {"tool": "death", "result": "Ran out of energy."}
             self.last_thought = "Everything fades..."
+            if self.goal_mapper is not None:
+                self.goal_mapper.reset_episode()
             return self.last_action
 
         # 1. Update QSE state
@@ -348,24 +489,55 @@ class KosmosAgent:
         self.surplus_mean = result["surplus_mean"]
         self.entropy = float(np.clip(result.get("normalized_entropy", 0.5), 0.05, 0.95))
         energy_for_goal = self.emile.body.state.energy if hasattr(self.emile, "body") else 0.5
+
+        # 2. L1: Strategy selection
         self.strategy = self.goal_module.select_goal(self.context, energy_for_goal, self.entropy)
 
-        # 2. Build situation description
+        # 3. L2: GoalMapper -> embodied goal
+        if self.goal_mapper is not None:
+            food_nearby = self._is_food_nearby()
+            shelter_nearby = self._is_shelter_nearby()
+            self.embodied_goal = self.goal_mapper.select_goal(
+                self.strategy, self.energy, self.energy,
+                food_nearby, shelter_nearby, self.entropy,
+            )
+
+        # 4. Build situation description
         situation = self._build_situation()
 
-        # 3. Decide action (LLM async or heuristic)
-        # Check if a previous LLM call has completed
-        if self._llm_pending is not None:
-            decision = self._llm_pending
-            self._llm_pending = None
+        # 5. Teacher-student decision
+        if self.action_policy is not None and np.random.random() > self._teacher_prob:
+            # Student: learned policy decides
+            self._used_learned = True
+            state_dict = self._build_policy_state_dict()
+            action_name, _, _ = self.action_policy.select_action(
+                state_dict, entropy=self.entropy,
+            )
+            decision = action_to_tool_call(action_name, self)
+            self._decision_source = "learned"
         else:
-            decision = self._heuristic_decide()
+            # Teacher: LLM (if pending and fresh) or heuristic
+            self._used_learned = False
+            if self._llm_pending is not None:
+                staleness = self.total_ticks - self._llm_pending_tick
+                if staleness <= 3:
+                    decision = self._llm_pending
+                    self._decision_source = "teacher_llm"
+                else:
+                    decision = self._heuristic_decide()
+                    self._decision_source = "teacher_heuristic"
+                self._llm_pending = None
+            else:
+                decision = self._heuristic_decide()
+                self._decision_source = "teacher_heuristic"
 
         # Fire off next LLM reasoning in background (if not already busy)
         if self.use_llm and not self._llm_busy:
             self._llm_busy = True
             categories = self._strategy_tool_categories()
             schemas = self.tools.schemas(categories)
+            tick_snapshot = self.total_ticks
+            last_res = str(self.last_action.get("result", "")) if self.last_action else ""
             llm_args = dict(
                 situation=situation,
                 tools=schemas,
@@ -374,10 +546,12 @@ class KosmosAgent:
                 energy=self.energy,
                 inventory=[f"{o.name} ({o.craft_tag})" for o in self.inventory],
                 memory_hits=self._recent_relevant_memories(),
+                last_result=last_res,
             )
             def _llm_reason():
                 try:
                     result = self.llm.reason(**llm_args)
+                    self._llm_pending_tick = tick_snapshot
                     self._llm_pending = result
                 finally:
                     self._llm_busy = False
@@ -385,16 +559,68 @@ class KosmosAgent:
 
         self.last_thought = decision.get("thought", "")
 
-        # 4. Execute tool
+        # 6. Execute tool
         tool_name = decision.get("tool", "wait")
         args = decision.get("args", {})
         result = self.tools.invoke(tool_name, **args)
 
-        # 5. Compute reward for TD(lambda)
+        # 7. Compute reward
         reward = self._compute_reward(tool_name, result)
+
+        # 8. Update L1: GoalModuleV2
         self.goal_module.update(reward, self.context, energy_for_goal)
 
-        # 6. Feed reward back to QSE
+        # 9. Update L2: GoalMapper
+        if self.goal_mapper is not None:
+            food_now = self._is_food_nearby()
+            shelter_now = self._is_shelter_nearby()
+            self.goal_mapper.update(
+                reward, self.strategy, self.energy, self.energy,
+                food_now, shelter_now,
+            )
+
+        # 10. Update L3: ActionPolicy + teacher-student decay
+        if self.action_policy is not None:
+            if self._used_learned:
+                self.action_policy.record_reward(reward)
+
+            self._policy_step_count += 1
+            if self._policy_step_count % self.config.POLICY_UPDATE_INTERVAL == 0:
+                self.action_policy.update()
+
+            # EMA reward tracking
+            ema_alpha = 0.02
+            if self._used_learned:
+                self._learned_reward_ema = (
+                    (1 - ema_alpha) * self._learned_reward_ema + ema_alpha * reward
+                )
+                self._learned_samples += 1
+            else:
+                self._heuristic_reward_ema = (
+                    (1 - ema_alpha) * self._heuristic_reward_ema + ema_alpha * reward
+                )
+
+            # Performance-gated teacher decay
+            decay = self.config.POLICY_TEACHER_DECAY
+            floor = self.config.POLICY_TEACHER_MIN
+            warmup = 200
+            if self._learned_samples < warmup:
+                self._teacher_prob = max(floor, self._teacher_prob * decay)
+            elif self._learned_reward_ema >= self._heuristic_reward_ema - 0.05:
+                self._teacher_prob = max(floor, self._teacher_prob * decay)
+            else:
+                self._teacher_prob = min(1.0, self._teacher_prob / decay)
+
+        # Console logging every 100 ticks
+        if self.total_ticks % 100 == 0:
+            teacher_count = self.total_ticks - self._learned_samples
+            print(
+                f"[t={self.total_ticks}] teacher_prob={self._teacher_prob:.3f} "
+                f"teacher={teacher_count} learned={self._learned_samples} "
+                f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f}"
+            )
+
+        # 11. Feed reward back to QSE
         with self._lock:
             self.emile.step(dt=0.005, external_input={"reward": reward})
 
@@ -422,6 +648,13 @@ class KosmosAgent:
             f"Energy: {self.energy:.0%}. Hydration: {self.hydration:.0%}.",
             f"Here: {here_str}.",
         ]
+        weather_name = self.world.weather_name
+        if weather_name != "clear":
+            parts.append(f"Weather: {weather_name}.")
+            if weather_name == "storm":
+                parts.append("DANGER: Storm! Find shelter.")
+            elif weather_name == "fog":
+                parts.append("Visibility reduced by fog.")
         if near_food:
             parts.append(f"{near_food} food source(s) nearby.")
         if near_water:
@@ -507,6 +740,26 @@ class KosmosAgent:
                                 "args": {"item1": a.name, "item2": b.name},
                                 "thought": "Can craft something!"}
 
+        # Storm: seek shelter (forest)
+        w = self.world.weather.current
+        if w and w.weather_type == WeatherType.STORM and w.intensity > 0.5:
+            if self.world.biomes[self.pos] not in (Biome.FOREST, Biome.ROCK):
+                # Move toward forest
+                for _, pos, _ in self.world.objects_near(self.pos, radius=5):
+                    if self.world.biomes[pos] == Biome.FOREST:
+                        d = self._direction_toward(pos)
+                        if d:
+                            return {"tool": "move", "args": {"direction": d},
+                                    "thought": "Storm! Need shelter."}
+                # No forest visible, try any non-exposed direction
+                for d in DIRECTIONS:
+                    nr = self.pos[0] + DIRECTIONS[d][0]
+                    nc = self.pos[1] + DIRECTIONS[d][1]
+                    if 0 <= nr < self.world.size and 0 <= nc < self.world.size:
+                        if self.world.biomes[nr, nc] in (Biome.FOREST, Biome.ROCK):
+                            return {"tool": "move", "args": {"direction": d},
+                                    "thought": "Seeking shelter from storm."}
+
         # Rest if energy low
         if self.energy < 0.2 and self.strategy == "rest":
             return {"tool": "rest", "args": {}, "thought": "Must rest."}
@@ -544,6 +797,9 @@ class KosmosAgent:
         self.alive = True
         self.inventory.clear()
         self.crafted.clear()
+        if self.goal_mapper is not None:
+            self.goal_mapper.reset_episode()
+        self.llm.history.clear()
         self._remember(f"Respawned at {self.pos}. Memories intact. Inventory lost.")
 
     # ------------------------------------------------------------------ #
@@ -572,4 +828,11 @@ class KosmosAgent:
             "time_of_day": self.world.time_of_day,
             "season": self.world.season,
             "use_llm": self.use_llm,
+            "embodied_goal": self.embodied_goal,
+            "teacher_prob": self._teacher_prob,
+            "decision_source": self._decision_source,
+            "learned_samples": self._learned_samples,
+            "learned_ema": self._learned_reward_ema,
+            "heuristic_ema": self._heuristic_reward_ema,
+            "weather": self.world.weather_name,
         }

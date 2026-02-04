@@ -4,6 +4,7 @@ import sys
 from .world.grid import KosmosWorld
 from .agent.core import KosmosAgent
 from .render.pygame_render import KosmosRenderer
+from .persistence import save_state, load_state
 
 
 def main():
@@ -12,6 +13,9 @@ def main():
     size = 30
     speed = 8
     seed = None
+    save_path = None
+    load_path = None
+    autosave = True
 
     args = sys.argv[1:]
     i = 0
@@ -28,6 +32,15 @@ def main():
         elif args[i] == "--seed" and i + 1 < len(args):
             seed = int(args[i + 1])
             i += 2
+        elif args[i] == "--save" and i + 1 < len(args):
+            save_path = args[i + 1]
+            i += 2
+        elif args[i] == "--load" and i + 1 < len(args):
+            load_path = args[i + 1]
+            i += 2
+        elif args[i] == "--no-autosave":
+            autosave = False
+            i += 1
         elif not args[i].startswith("--"):
             model = args[i]
             i += 1
@@ -40,9 +53,24 @@ def main():
     world = KosmosWorld(size=size, seed=seed)
     agent = KosmosAgent(world, model=model)
 
+    if load_path:
+        try:
+            load_state(load_path, world, agent)
+            print(f"  Loaded state from {load_path}")
+        except Exception as e:
+            print(f"  Failed to load state: {e}")
+
     renderer = KosmosRenderer(world, agent, cell_size=max(12, 600 // size))
     renderer.speed = speed
     renderer.run()
+
+    # Auto-save on quit
+    if autosave and save_path:
+        try:
+            save_state(world, agent, save_path)
+            print(f"  State saved to {save_path}")
+        except Exception as e:
+            print(f"  Failed to save state: {e}")
 
     print("  Kosmos ended.")
 

@@ -126,10 +126,68 @@ class CraftItem(WorldObject):
             self.name, self.color, self.craft_tag = v
 
 
+@dataclass
+class Herb(Food):
+    """Medicinal plant. Low energy but provides healing."""
+    name: str = "herb"
+    symbol: str = "h"
+    color: tuple = (80, 200, 120)
+    energy_value: float = 0.05
+    heal_value: float = 0.10
+    decay_rate: float = 0.005
+
+    def __post_init__(self):
+        variants = [
+            ("mint", (80, 200, 120), 0.04, 0.08, 0.005),
+            ("sage", (100, 180, 100), 0.06, 0.12, 0.004),
+        ]
+        if self.name == "herb":
+            v = variants[np.random.randint(len(variants))]
+            self.name, self.color, self.energy_value, self.heal_value, self.decay_rate = v
+
+
+@dataclass
+class Seed(CraftItem):
+    """Plantable seed. Can be placed to grow into food over time."""
+    name: str = "seed"
+    symbol: str = "."
+    color: tuple = (160, 140, 80)
+    craft_tag: str = "seed"
+    decay_rate: float = 0.0
+
+    def __post_init__(self):
+        pass  # No randomization
+
+
+@dataclass
+class PlantedCrop(WorldObject):
+    """A planted seed growing into food. Matures over time."""
+    name: str = "sprout"
+    symbol: str = "i"
+    color: tuple = (60, 160, 60)
+    growth_ticks: int = 0
+    mature_at: int = 100
+
+    def tick(self) -> bool:
+        self.age += 1
+        self.growth_ticks += 1
+        if self.growth_ticks > self.mature_at * 0.5:
+            self.name = "young_plant"
+            self.color = (80, 180, 60)
+        return True
+
+    @property
+    def is_mature(self) -> bool:
+        return self.growth_ticks >= self.mature_at
+
+
 # Craft recipes: (tag1, tag2) -> result_name, result_description
 CRAFT_RECIPES = {
     ("wood", "stone"): ("axe", "A crude axe. Reduces forest movement cost."),
     ("wood", "fiber"): ("rope", "A length of rope. Can cross water more easily."),
     ("stone", "fiber"): ("sling", "A sling. Can scare away hazards."),
     ("wood", "shell"): ("bowl", "A bowl. Can carry water."),
+    ("fiber", "shell"): ("basket", "A woven basket. Increases inventory capacity."),
+    ("stone", "stone"): ("flint", "A flint striker. Enables cooking for better food."),
+    ("wood", "wood"): ("shelter_frame", "A portable shelter. Reduces night penalty."),
 }

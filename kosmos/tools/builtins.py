@@ -57,4 +57,10 @@ def get_builtin_tools() -> list[Tool]:
             parameters={},
             category="action",
         ),
+        Tool(
+            name="plant",
+            description="Plant a seed from inventory at current position. It will grow into food.",
+            parameters={"item": "Name of seed to plant (default: seed)"},
+            category="action",
+        ),
     ]
