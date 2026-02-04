@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emile-kosmos"
+version = "0.1.0"
+description = "Émile-Kosmos: a living world powered by QSE cognition and LLM reasoning."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Del Coburn", email = "del.coburn@mail.utoronto.ca"}]
+dependencies = [
+    "emile-mini>=0.6.0",
+    "numpy>=1.23",
+    "pygame-ce>=2.4",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/baglecake/emile-kosmos"
+
+[project.scripts]
+emile-kosmos = "kosmos.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["kosmos*"]
