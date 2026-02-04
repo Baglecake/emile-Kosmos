@@ -1,4 +1,4 @@
-# emile-Kosmos
+# émile-Kosmos
 
 A living world simulation where an autonomous agent survives in a procedurally
 generated environment. The agent's cognition is driven by a **Quantum Surplus
