@@ -396,9 +396,9 @@ class KosmosAgent:
         here = self.world.objects_at(self.pos)
         here_str = ", ".join(o.name for o in here) if here else "nothing"
         nearby = self.world.objects_near(self.pos, radius=3)
-        near_food = sum(1 for _, _, o in nearby if isinstance(o, Food) and _ > 0)
-        near_water = sum(1 for _, _, o in nearby if isinstance(o, Water) and _ > 0)
-        near_hazard = sum(1 for _, _, o in nearby if isinstance(o, Hazard) and _ > 0)
+        near_food = sum(1 for d, _, o in nearby if isinstance(o, Food) and d > 0)
+        near_water = sum(1 for d, _, o in nearby if isinstance(o, Water) and d > 0)
+        near_hazard = sum(1 for d, _, o in nearby if isinstance(o, Hazard) and d > 0)
 
         parts = [
             f"Position: {self.pos} in {biome}. Time: {tod}.",
