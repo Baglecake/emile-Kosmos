@@ -65,6 +65,7 @@ class KosmosRenderer:
         self.narration_lines: list[str] = []
         self.narration_timer = 0
         self._narrate_lock = threading.Lock()
+        self._narrate_semaphore = threading.Semaphore(2)
 
     def init_pygame(self):
         pygame.init()
@@ -161,14 +162,19 @@ class KosmosRenderer:
             self._request_narration(event_desc)
 
     def _request_narration(self, event: str):
-        """Request LLM narration in background thread."""
+        """Request LLM narration in background thread (max 2 concurrent)."""
+        if not self._narrate_semaphore.acquire(blocking=False):
+            return  # Already 2 narrations in flight, skip
         def _do():
-            text = self.agent.llm.narrate(event, self.agent.strategy, self.agent.entropy)
-            if text:
-                with self._narrate_lock:
-                    self.narration_lines.append(text)
-                    if len(self.narration_lines) > 6:
-                        self.narration_lines = self.narration_lines[-6:]
+            try:
+                text = self.agent.llm.narrate(event, self.agent.strategy, self.agent.entropy)
+                if text:
+                    with self._narrate_lock:
+                        self.narration_lines.append(text)
+                        if len(self.narration_lines) > 6:
+                            self.narration_lines = self.narration_lines[-6:]
+            finally:
+                self._narrate_semaphore.release()
         threading.Thread(target=_do, daemon=True).start()
 
     # ------------------------------------------------------------------ #

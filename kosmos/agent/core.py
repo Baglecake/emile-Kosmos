@@ -96,6 +96,10 @@ class KosmosAgent:
         self.last_thought: str = ""
         self.last_narration: str = ""
 
+        # Async LLM reasoning
+        self._llm_pending: Optional[dict] = None  # result from background LLM call
+        self._llm_busy = False  # True while a reasoning call is in flight
+
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
     # ------------------------------------------------------------------ #
@@ -342,19 +346,27 @@ class KosmosAgent:
             })
         self.context = result["context"]
         self.surplus_mean = result["surplus_mean"]
-        self.entropy = float(np.clip(1.0 - self.surplus_mean, 0.05, 0.95))
+        self.entropy = float(np.clip(result.get("normalized_entropy", 0.5), 0.05, 0.95))
         energy_for_goal = self.emile.body.state.energy if hasattr(self.emile, "body") else 0.5
         self.strategy = self.goal_module.select_goal(self.context, energy_for_goal, self.entropy)
 
         # 2. Build situation description
         situation = self._build_situation()
 
-        # 3. Decide action (LLM or heuristic)
-        if self.use_llm:
-            # QSE strategy influences which tool categories the LLM sees
+        # 3. Decide action (LLM async or heuristic)
+        # Check if a previous LLM call has completed
+        if self._llm_pending is not None:
+            decision = self._llm_pending
+            self._llm_pending = None
+        else:
+            decision = self._heuristic_decide()
+
+        # Fire off next LLM reasoning in background (if not already busy)
+        if self.use_llm and not self._llm_busy:
+            self._llm_busy = True
             categories = self._strategy_tool_categories()
             schemas = self.tools.schemas(categories)
-            decision = self.llm.reason(
+            llm_args = dict(
                 situation=situation,
                 tools=schemas,
                 strategy=self.strategy,
@@ -363,8 +375,13 @@ class KosmosAgent:
                 inventory=[f"{o.name} ({o.craft_tag})" for o in self.inventory],
                 memory_hits=self._recent_relevant_memories(),
             )
-        else:
-            decision = self._heuristic_decide()
+            def _llm_reason():
+                try:
+                    result = self.llm.reason(**llm_args)
+                    self._llm_pending = result
+                finally:
+                    self._llm_busy = False
+            threading.Thread(target=_llm_reason, daemon=True).start()
 
         self.last_thought = decision.get("thought", "")
 

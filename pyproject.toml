@@ -11,8 +11,8 @@ requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Del Coburn", email = "del.coburn@mail.utoronto.ca"}]
 dependencies = [
-    "emile-mini>=0.6.0",
     "numpy>=1.23",
+    "scipy>=1.10",
     "pygame-ce>=2.4",
     "requests>=2.28",
 ]
@@ -27,4 +27,4 @@ Homepage = "https://github.com/baglecake/emile-kosmos"
 emile-kosmos = "kosmos.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["kosmos*"]
+include = ["kosmos*", "emile_mini*"]

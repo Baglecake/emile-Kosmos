@@ -129,6 +129,15 @@ class KosmosWorld:
         self.tick_count += 1
         self.events.clear()
 
+        # Seasonal modulation of spawn rates
+        _season_mods = {
+            "spring": (1.0, 1.0, 1.0),    # (food_target, food_prob, hazard_prob)
+            "summer": (0.85, 0.85, 1.8),
+            "autumn": (1.4, 1.3, 0.7),
+            "winter": (0.5, 0.5, 1.5),
+        }
+        ft_mod, fp_mod, hp_mod = _season_mods.get(self.season, (1.0, 1.0, 1.0))
+
         # Decay existing objects
         to_remove = []
         for pos, objs in self.objects.items():
@@ -152,8 +161,8 @@ class KosmosWorld:
             1 for objs in self.objects.values()
             for obj in objs if isinstance(obj, Food)
         )
-        target_food = int(self.size * self.size * 0.06)
-        if food_count < target_food and self.rng.random() < 0.15:
+        target_food = int(self.size * self.size * 0.06 * ft_mod)
+        if food_count < target_food and self.rng.random() < 0.15 * fp_mod:
             pos = self._random_pos(prefer=[Biome.PLAINS, Biome.FOREST])
             if pos not in self.objects or not any(
                 isinstance(o, Food) for o in self.objects.get(pos, [])
@@ -164,7 +173,7 @@ class KosmosWorld:
                 })
 
         # Occasional hazard spawns
-        if self.rng.random() < 0.02:
+        if self.rng.random() < 0.02 * hp_mod:
             pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
             self._add_object(Hazard(position=pos), pos)
 
