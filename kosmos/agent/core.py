@@ -99,6 +99,7 @@ class KosmosAgent:
         self.water_drunk = 0
         self.damage_taken = 0
         self.cells_visited: set[tuple] = {self.pos}
+        self._last_move_was_new_cell = False  # For exploration reward bug fix
         self.steps_taken = 0
 
         # Last action result (for renderer)
@@ -242,6 +243,8 @@ class KosmosAgent:
         self.energy -= cost
         self.pos = (nr, nc)
         self.facing = d
+        # Track if this is a new cell BEFORE adding (for exploration reward)
+        self._last_move_was_new_cell = self.pos not in self.cells_visited
         self.cells_visited.add(self.pos)
         self.steps_taken += 1
         # Check for hazards at new position
@@ -1085,8 +1088,10 @@ class KosmosAgent:
             r -= 0.4
 
         # Exploration bonus (reduced to not overshadow survival)
-        if tool_name == "move" and self.pos not in self.cells_visited:
+        # Use _last_move_was_new_cell flag (set before adding to cells_visited)
+        if tool_name == "move" and getattr(self, '_last_move_was_new_cell', False):
             r += 0.05  # was 0.1 - reduced to prioritize survival
+            self._last_move_was_new_cell = False  # Reset flag
 
         if self.energy < 0.15:
             r -= 0.2  # danger penalty
