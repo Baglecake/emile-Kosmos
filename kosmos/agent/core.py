@@ -188,7 +188,8 @@ class KosmosAgent:
         self._last_death_tick = 0
         self._ticks_since_death = 0
         self._death_rate_ema = 30.0  # Deaths per 1000 ticks (start pessimistic)
-        self._baseline_death_rate = 30.0  # Teacher's death rate (updated during warmup)
+        self._baseline_death_rate = 30.0  # Teacher's best death rate (frozen after warmup)
+        self._baseline_frozen = False  # Freeze baseline at end of warmup
 
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
@@ -865,11 +866,18 @@ class KosmosAgent:
 
             if self._learned_samples < warmup:
                 # During warmup: establish baseline, slow decay
-                # Update baseline death rate from teacher's performance
-                self._baseline_death_rate = 0.95 * self._baseline_death_rate + 0.05 * self._death_rate_ema
+                # Track the BEST (lowest) death rate as baseline - not EMA
+                # This captures teacher's best performance, not degrading average
+                if self._death_rate_ema < self._baseline_death_rate:
+                    self._baseline_death_rate = self._death_rate_ema
                 # Very slow decay during warmup
                 self._teacher_prob = max(floor, self._teacher_prob * 0.9999)
             else:
+                # Freeze baseline at end of warmup (only once)
+                if not self._baseline_frozen:
+                    self._baseline_frozen = True
+                    print(f"[Baseline frozen] death_rate={self._baseline_death_rate:.1f} "
+                          f"at samples={self._learned_samples}")
                 # After warmup: competence-gated decay
                 # Student is competent if:
                 # 1. Reward EMA is at least 90% of heuristic EMA
