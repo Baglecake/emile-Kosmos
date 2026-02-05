@@ -87,8 +87,8 @@ class QSEConfig:
     POLICY_GAMMA: float = 0.99
     POLICY_UPDATE_INTERVAL: int = 50
     POLICY_TEACHER_DECAY: float = 0.9995  # Slower decay to give student time to learn
-    POLICY_TEACHER_MIN: float = 0.1
-    POLICY_TEACHER_WARMUP: int = 500  # Samples before decay starts
+    POLICY_TEACHER_MIN: float = 0.15  # Higher floor so heuristic can intervene for survival
+    POLICY_TEACHER_WARMUP: int = 2000  # More samples before decay starts (was 500)
 
 # Safe load of config.yaml, ignoring unknown keys
 def load_config(path: str = "config.yaml") -> QSEConfig:

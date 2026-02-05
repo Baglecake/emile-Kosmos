@@ -984,23 +984,43 @@ class KosmosAgent:
         return self.memories[-5:] if self.memories else []
 
     def _compute_reward(self, tool_name: str, result: dict) -> float:
-        """Reward signal for TD(lambda) learning."""
+        """Reward signal for TD(lambda) learning.
+
+        Shaped to encourage survival:
+        - Eating/drinking scaled by urgency (low energy = bigger reward)
+        - Penalty for ignoring food when hungry
+        - Penalty for failed consume attempts (teaches when to eat)
+        """
         r = -0.01  # small step cost (existence tax)
 
         res = str(result.get("result", ""))
 
+        # Eating reward scaled by urgency (0.5 base, up to 1.0 when starving)
         if "Ate" in res or "Drank" in res:
-            r += 0.5
+            urgency_bonus = 0.5 * (1.0 - self.energy)  # 0 when full, 0.5 when empty
+            r += 0.5 + urgency_bonus
         if "Crafted" in res:
             r += 0.8
         if "Picked up" in res:
             r += 0.2
         if "Ouch" in res or "damage" in res.lower():
             r -= 0.4
+
+        # Exploration bonus (reduced to not overshadow survival)
         if tool_name == "move" and self.pos not in self.cells_visited:
-            r += 0.1  # exploration bonus
+            r += 0.05  # was 0.1 - reduced to prioritize survival
+
         if self.energy < 0.15:
             r -= 0.2  # danger penalty
+
+        # Penalty for ignoring food when hungry (teaches to eat when appropriate)
+        has_food_here = any(isinstance(o, Food) for o in self.world.objects_at(self.pos))
+        if has_food_here and self.energy < 0.5 and tool_name != "consume":
+            r -= 0.15  # missed opportunity to eat
+
+        # Penalty for failed consume (teaches to only consume when food present)
+        if tool_name == "consume" and "Nothing to consume" in res:
+            r -= 0.1  # wasted action
 
         return float(np.clip(r, -1.0, 1.0))
 

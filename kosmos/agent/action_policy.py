@@ -113,7 +113,13 @@ def encode_kosmos_state(
     state[31] = float(np.clip(hazard_dx, -1.0, 1.0))
     state[32] = float(np.clip(hazard_dy, -1.0, 1.0))
 
-    # [33] reserved
+    # Survival urgency signal [33] - strong signal for "should eat NOW"
+    # Combines low energy with food availability
+    should_eat_urgency = 0.0
+    if has_food_here and energy < 0.5:
+        should_eat_urgency = (0.5 - energy) * 2.0  # 0 at 0.5 energy, 1.0 at 0 energy
+    state[33] = should_eat_urgency
+
     return state
 
 
