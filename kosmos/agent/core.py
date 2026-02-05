@@ -128,11 +128,36 @@ class KosmosAgent:
         self._used_learned = False
         self._decision_source = "teacher"
         self._policy_step_count = 0
+        self._consciousness_zone = "healthy"  # crisis/struggling/healthy/transcendent
 
         # Async LLM reasoning
         self._llm_pending: Optional[dict] = None
         self._llm_busy = False
         self._llm_pending_tick = 0
+
+        # Event detection for 5b: event-triggered LLM calls
+        self._prev_biome: Optional[str] = None
+        self._prev_strategy: Optional[str] = None
+        self._prev_zone: Optional[str] = None
+        self._prev_weather: Optional[str] = None
+        self._seen_objects: set[str] = set()  # for first-discovery events
+        self._ticks_since_llm = 0  # force periodic refresh
+        self._last_significant_event: str = ""  # what triggered the LLM call
+
+        # 5c: Surplus-faucet goal pressure
+        self._goal_satisfaction = 0.5  # EMA of recent goal achievement
+        self._recent_rewards: list[float] = []  # last N rewards for satisfaction calc
+
+        # 5d: Information metabolism (anti-camping)
+        self._recent_positions: list[tuple] = []  # last N positions for novelty calc
+        self._novelty = 0.5  # current novelty level (0=camping, 1=exploring)
+
+        # 5e: Multi-step LLM planning
+        self._current_plan: list[dict] = []  # queue of planned actions
+        self._plan_goal: str = ""  # what the plan is trying to achieve
+        self._plan_replan_if: list[str] = []  # conditions that trigger replan
+        self._plan_strategy: str = ""  # strategy when plan was created
+        self._use_planning = True  # enable/disable planning mode
 
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
@@ -406,6 +431,69 @@ class KosmosAgent:
                     return True
         return False
 
+    def _build_visual_field(self, radius: int = 3) -> str:
+        """
+        Build ASCII mini-map for LLM spatial perception.
+
+        Legend:
+          @ = agent (you)
+          F = food, ~ = water, ! = hazard, + = craft item
+          T = forest, : = desert, ^ = rock, . = plains, # = wall/edge
+        """
+        BIOME_CHARS = {
+            Biome.PLAINS: ".",
+            Biome.FOREST: "T",
+            Biome.DESERT: ":",
+            Biome.WATER: "~",
+            Biome.ROCK: "^",
+        }
+
+        lines = []
+        # Add north indicator
+        lines.append("         N")
+
+        for dr in range(-radius, radius + 1):
+            row = []
+            # West indicator on middle row
+            if dr == 0:
+                row.append("W ")
+            else:
+                row.append("  ")
+
+            for dc in range(-radius, radius + 1):
+                r, c = self.pos[0] + dr, self.pos[1] + dc
+
+                if (r, c) == self.pos:
+                    row.append("@")
+                elif not (0 <= r < self.world.size and 0 <= c < self.world.size):
+                    row.append("#")  # wall/edge
+                else:
+                    # Check objects at this cell (priority: hazard > food > water > item)
+                    objs = self.world.objects_at((r, c))
+                    if any(isinstance(o, Hazard) for o in objs):
+                        row.append("!")
+                    elif any(isinstance(o, Food) for o in objs):
+                        row.append("F")
+                    elif any(isinstance(o, Water) for o in objs):
+                        row.append("~")
+                    elif any(isinstance(o, CraftItem) for o in objs):
+                        row.append("+")
+                    else:
+                        # Show biome
+                        biome = self.world.biomes[r, c]
+                        row.append(BIOME_CHARS.get(biome, "?"))
+
+            # East indicator on middle row
+            if dr == 0:
+                row.append(" E")
+
+            lines.append(" ".join(row))
+
+        # Add south indicator
+        lines.append("         S")
+
+        return "\n".join(lines)
+
     def _build_policy_state_dict(self) -> dict:
         nearby = self.world.objects_near(self.pos, radius=3)
         near_food = sum(1 for d, _, o in nearby if isinstance(o, Food) and d > 0)
@@ -455,9 +543,10 @@ class KosmosAgent:
 
         self.total_ticks += 1
 
-        # Basal metabolism
-        self.energy -= 0.003
-        self.hydration -= 0.001
+        # Basal metabolism (tuned for complex behavior emergence)
+        # Lower rate gives agent time for multi-step plans, crafting, cultivation
+        self.energy -= 0.002  # was 0.003
+        self.hydration -= 0.0008  # was 0.001
 
         # Weather effects on metabolism
         w = self.world.weather.current
@@ -473,6 +562,10 @@ class KosmosAgent:
         if self.energy <= 0:
             self.alive = False
             self.deaths += 1
+            biome_name = self.world.biomes[self.pos].name
+            weather_name = self.world.weather.current.weather_type.name if self.world.weather.current else "clear"
+            print(f"[DEATH t={self.total_ticks}] pos={self.pos} biome={biome_name} weather={weather_name} "
+                  f"zone={self._consciousness_zone} hydration={self.hydration:.2f} deaths={self.deaths}")
             self._remember(f"Died of exhaustion at {self.pos}. Death #{self.deaths}.")
             self.last_action = {"tool": "death", "result": "Ran out of energy."}
             self.last_thought = "Everything fades..."
@@ -505,8 +598,32 @@ class KosmosAgent:
         # 4. Build situation description
         situation = self._build_situation()
 
-        # 5. Teacher-student decision
-        if self.action_policy is not None and np.random.random() > self._teacher_prob:
+        # 4.5 Consciousness zone classification (for survival override)
+        # Crisis: force heuristic survival actions, no learned policy
+        # Struggling: bias toward teacher, slow decay
+        # Healthy: normal teacher-student balance
+        # Transcendent: allow exploration, faster decay
+        # NOTE: Crisis is energy-only — entropy affects creativity, not survival
+        # Thresholds tuned to give agent time for complex behaviors
+        if self.energy < 0.25:  # was 0.20 — earlier intervention
+            self._consciousness_zone = "crisis"
+        elif self.energy < 0.40:  # was 0.35 — more buffer
+            self._consciousness_zone = "struggling"
+        elif self.energy > 0.7 and self.entropy < 0.4:
+            self._consciousness_zone = "transcendent"
+        else:
+            self._consciousness_zone = "healthy"
+
+        # 5. Teacher-student decision (gated by consciousness zone)
+        # In crisis zone, ALWAYS use heuristic — survival reflex override
+        if self._consciousness_zone == "crisis":
+            # Abort any active plan in crisis
+            if self._current_plan:
+                self._current_plan.clear()
+            decision = self._heuristic_decide()
+            self._decision_source = "survival_reflex"
+            self._used_learned = False
+        elif self.action_policy is not None and np.random.random() > self._teacher_prob:
             # Student: learned policy decides
             self._used_learned = True
             state_dict = self._build_policy_state_dict()
@@ -516,13 +633,40 @@ class KosmosAgent:
             decision = action_to_tool_call(action_name, self)
             self._decision_source = "learned"
         else:
-            # Teacher: LLM (if pending and fresh) or heuristic
+            # Teacher path: use planning (5e) if enabled
             self._used_learned = False
-            if self._llm_pending is not None:
+
+            # Check for plan interrupts
+            should_interrupt, interrupt_reason = self._check_plan_interrupt()
+            if should_interrupt and self._current_plan:
+                self._current_plan.clear()
+                self._plan_goal = ""
+
+            # Try to execute from current plan
+            if self._use_planning and self._current_plan:
+                decision = self._current_plan.pop(0)
+                self._decision_source = "teacher_plan"
+            elif self._llm_pending is not None:
+                # Check if pending LLM result is a plan or single action
                 staleness = self.total_ticks - self._llm_pending_tick
                 if staleness <= 3:
-                    decision = self._llm_pending
-                    self._decision_source = "teacher_llm"
+                    pending = self._llm_pending
+                    if "plan" in pending and isinstance(pending["plan"], list):
+                        # It's a plan response
+                        self._current_plan = pending["plan"]
+                        self._plan_goal = pending.get("goal", "")
+                        self._plan_replan_if = pending.get("replan_if", [])
+                        self._plan_strategy = self.strategy
+                        if self._current_plan:
+                            decision = self._current_plan.pop(0)
+                            self._decision_source = "teacher_plan"
+                        else:
+                            decision = self._heuristic_decide()
+                            self._decision_source = "teacher_heuristic"
+                    else:
+                        # Single action response (backwards compatible)
+                        decision = pending
+                        self._decision_source = "teacher_llm"
                 else:
                     decision = self._heuristic_decide()
                     self._decision_source = "teacher_heuristic"
@@ -531,15 +675,22 @@ class KosmosAgent:
                 decision = self._heuristic_decide()
                 self._decision_source = "teacher_heuristic"
 
-        # Fire off next LLM reasoning in background (if not already busy)
-        if self.use_llm and not self._llm_busy:
+        # Fire off next LLM reasoning in background (event-triggered, 5b)
+        # Only fire if we don't have an active plan (or plan is almost done)
+        should_fire, fire_reason = self._should_fire_llm()
+        need_new_plan = len(self._current_plan) <= 1  # Request plan when almost empty
+        if self.use_llm and not self._llm_busy and should_fire and need_new_plan:
             self._llm_busy = True
             categories = self._strategy_tool_categories()
             schemas = self.tools.schemas(categories)
             tick_snapshot = self.total_ticks
             last_res = str(self.last_action.get("result", "")) if self.last_action else ""
+            # Include the trigger reason in the situation for context
+            situation_with_trigger = situation
+            if fire_reason and fire_reason != "periodic refresh":
+                situation_with_trigger = f"[Event: {fire_reason}]\n\n{situation}"
             llm_args = dict(
-                situation=situation,
+                situation=situation_with_trigger,
                 tools=schemas,
                 strategy=self.strategy,
                 entropy=self.entropy,
@@ -548,9 +699,14 @@ class KosmosAgent:
                 memory_hits=self._recent_relevant_memories(),
                 last_result=last_res,
             )
+            use_planning = self._use_planning
+
             def _llm_reason():
                 try:
-                    result = self.llm.reason(**llm_args)
+                    if use_planning:
+                        result = self.llm.reason_plan(**llm_args)
+                    else:
+                        result = self.llm.reason(**llm_args)
                     self._llm_pending_tick = tick_snapshot
                     self._llm_pending = result
                 finally:
@@ -603,7 +759,7 @@ class KosmosAgent:
             # Performance-gated teacher decay
             decay = self.config.POLICY_TEACHER_DECAY
             floor = self.config.POLICY_TEACHER_MIN
-            warmup = 200
+            warmup = getattr(self.config, 'POLICY_TEACHER_WARMUP', 500)
             if self._learned_samples < warmup:
                 self._teacher_prob = max(floor, self._teacher_prob * decay)
             elif self._learned_reward_ema >= self._heuristic_reward_ema - 0.05:
@@ -615,14 +771,60 @@ class KosmosAgent:
         if self.total_ticks % 100 == 0:
             teacher_count = self.total_ticks - self._learned_samples
             print(
-                f"[t={self.total_ticks}] teacher_prob={self._teacher_prob:.3f} "
+                f"[t={self.total_ticks}] zone={self._consciousness_zone} "
+                f"teacher_prob={self._teacher_prob:.3f} "
                 f"teacher={teacher_count} learned={self._learned_samples} "
                 f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f}"
             )
 
-        # 11. Feed reward back to QSE
+        # 11. Surplus-faucet goal pressure (5c)
+        # Track recent rewards to compute goal satisfaction
+        self._recent_rewards.append(reward)
+        if len(self._recent_rewards) > 20:
+            self._recent_rewards = self._recent_rewards[-20:]
+
+        # Compute goal satisfaction: how well are recent actions achieving goals?
+        # Positive rewards = good, scaled 0-1
+        if self._recent_rewards:
+            avg_reward = np.mean(self._recent_rewards)
+            # Map reward range [-1, 1] to satisfaction [0, 1]
+            self._goal_satisfaction = 0.9 * self._goal_satisfaction + 0.1 * ((avg_reward + 1) / 2)
+        self._goal_satisfaction = float(np.clip(self._goal_satisfaction, 0.1, 0.9))
+
+        # Apply metabolic pressure: low satisfaction = higher energy cost
+        # gamma_effective = gamma * (0.3 + 0.7 * goal_satisfaction)
+        # Translate to: extra_cost = base_pressure * (1 - goal_satisfaction)
+        # Reduced to give agent more breathing room for complex behaviors
+        goal_pressure = 0.001 * (1 - self._goal_satisfaction)  # was 0.002
+        self.energy -= goal_pressure
+
+        # 11b. Information metabolism (5d: anti-camping)
+        # Track recent positions to compute novelty
+        self._recent_positions.append(self.pos)
+        window_size = 30
+        if len(self._recent_positions) > window_size:
+            self._recent_positions = self._recent_positions[-window_size:]
+
+        # Compute novelty: unique positions in recent window / window size
+        unique_positions = len(set(self._recent_positions))
+        raw_novelty = unique_positions / max(1, len(self._recent_positions))
+        # EMA smoothing
+        self._novelty = 0.9 * self._novelty + 0.1 * raw_novelty
+        self._novelty = float(np.clip(self._novelty, 0.1, 0.9))
+
+        # Apply novelty-based energy modulation:
+        # High novelty (exploring) = small energy bonus
+        # Low novelty (camping) = small energy drain
+        # Neutral point at novelty = 0.3 (reduced to encourage staying for cultivation)
+        novelty_effect = (self._novelty - 0.3) * 0.002  # was 0.003, neutral at 0.4
+        self.energy += novelty_effect
+
+        # Modulate reward fed to QSE: amplify when achieving goals
+        qse_reward = reward * (0.3 + 0.7 * self._goal_satisfaction)
+
+        # 12. Feed modulated reward back to QSE
         with self._lock:
-            self.emile.step(dt=0.005, external_input={"reward": reward})
+            self.emile.step(dt=0.005, external_input={"reward": qse_reward})
 
         self.last_action = {
             "tool": tool_name,
@@ -633,37 +835,78 @@ class KosmosAgent:
         return self.last_action
 
     def _build_situation(self) -> str:
-        """Describe current situation for LLM."""
+        """Describe current situation for LLM with visual field."""
         biome = self.world.biomes[self.pos].value
         tod = self.world.time_of_day
         here = self.world.objects_at(self.pos)
         here_str = ", ".join(o.name for o in here) if here else "nothing"
-        nearby = self.world.objects_near(self.pos, radius=3)
-        near_food = sum(1 for d, _, o in nearby if isinstance(o, Food) and d > 0)
-        near_water = sum(1 for d, _, o in nearby if isinstance(o, Water) and d > 0)
-        near_hazard = sum(1 for d, _, o in nearby if isinstance(o, Hazard) and d > 0)
+
+        # Build visual field first
+        # Radius=5 so LLM can see what the heuristic's radius=8 search might find
+        visual_field = self._build_visual_field(radius=5)
 
         parts = [
+            f"Your field of vision (@ = you):",
+            visual_field,
+            f"Legend: F=food, ~=water, !=hazard, +=item, T=forest, :=desert, ^=rock, .=plains",
+            "",
             f"Position: {self.pos} in {biome}. Time: {tod}.",
             f"Energy: {self.energy:.0%}. Hydration: {self.hydration:.0%}.",
-            f"Here: {here_str}.",
+            f"Standing on: {here_str}.",
         ]
+
         weather_name = self.world.weather_name
         if weather_name != "clear":
             parts.append(f"Weather: {weather_name}.")
             if weather_name == "storm":
-                parts.append("DANGER: Storm! Find shelter.")
+                parts.append("DANGER: Storm! Seek forest (T) for shelter.")
             elif weather_name == "fog":
                 parts.append("Visibility reduced by fog.")
-        if near_food:
-            parts.append(f"{near_food} food source(s) nearby.")
-        if near_water:
-            parts.append(f"{near_water} water source(s) nearby.")
-        if near_hazard:
-            parts.append(f"WARNING: {near_hazard} hazard(s) nearby!")
+
         if self.energy < 0.25:
-            parts.append("CRITICAL: Energy dangerously low!")
-        return " ".join(parts)
+            parts.append("CRITICAL: Energy dangerously low! Find food (F) immediately!")
+        if self.hydration < 0.25:
+            parts.append("CRITICAL: Dehydrated! Find water (~) immediately!")
+
+        # Internal state (5a-alt: QSE-derived metrics)
+        # Arousal from entropy (high entropy = high arousal/uncertainty)
+        if self.entropy > 0.7:
+            arousal = "agitated"
+        elif self.entropy > 0.4:
+            arousal = "alert"
+        else:
+            arousal = "calm"
+
+        # Valence from recent reward history (approximate from EMAs)
+        avg_ema = (self._learned_reward_ema + self._heuristic_reward_ema) / 2
+        if avg_ema > 0.05:
+            valence = "positive"
+        elif avg_ema < -0.05:
+            valence = "negative"
+        else:
+            valence = "neutral"
+
+        # Consciousness zone already computed in tick()
+        zone = self._consciousness_zone
+
+        parts.append("")
+        parts.append(f"Internal state: {arousal}, feeling {valence}, zone: {zone}")
+
+        # Plan execution feedback (so LLM knows what happened to previous plans)
+        if self._plan_goal:
+            parts.append("")
+            parts.append(f"Current plan goal: {self._plan_goal}")
+            parts.append(f"Steps remaining: {len(self._current_plan)}")
+        elif self.last_action and self.last_action.get("tool") != "death":
+            # No active plan - tell LLM what just happened
+            last_tool = self.last_action.get("tool", "unknown")
+            last_result = self.last_action.get("result", "")
+            last_reward = self.last_action.get("reward", 0)
+            outcome = "successful" if last_reward > 0 else "unsuccessful" if last_reward < 0 else "neutral"
+            parts.append("")
+            parts.append(f"Last action: {last_tool} was {outcome}. Result: {last_result[:80]}")
+
+        return "\n".join(parts)
 
     def _strategy_tool_categories(self) -> list[str]:
         """QSE strategy determines which tools the LLM considers."""
@@ -703,20 +946,61 @@ class KosmosAgent:
 
     def _heuristic_decide(self) -> dict:
         """Fallback decision-making when LLM is unavailable."""
-        # Emergency: eat if food here and low energy
-        if self.energy < 0.3:
+        # PRIORITY 1: Hazard avoidance — flee if hazard within 2 cells
+        nearby = self.world.objects_near(self.pos, radius=2)
+        for dist, haz_pos, obj in nearby:
+            if isinstance(obj, Hazard) and dist > 0:
+                # Move away from hazard
+                dr = self.pos[0] - haz_pos[0]
+                dc = self.pos[1] - haz_pos[1]
+                if abs(dr) >= abs(dc):
+                    flee_dir = "south" if dr > 0 else "north"
+                else:
+                    flee_dir = "east" if dc > 0 else "west"
+                # Validate the flee direction is in bounds
+                nr = self.pos[0] + DIRECTIONS[flee_dir][0]
+                nc = self.pos[1] + DIRECTIONS[flee_dir][1]
+                if 0 <= nr < self.world.size and 0 <= nc < self.world.size:
+                    return {"tool": "move", "args": {"direction": flee_dir},
+                            "thought": "Danger! Fleeing from hazard."}
+                # If can't flee that way, try perpendicular
+                perp_dirs = ["east", "west"] if abs(dr) >= abs(dc) else ["north", "south"]
+                for d in perp_dirs:
+                    nr = self.pos[0] + DIRECTIONS[d][0]
+                    nc = self.pos[1] + DIRECTIONS[d][1]
+                    if 0 <= nr < self.world.size and 0 <= nc < self.world.size:
+                        return {"tool": "move", "args": {"direction": d},
+                                "thought": "Evading hazard."}
+
+        # PRIORITY 2: Emergency food/water if low energy/hydration
+        if self.energy < 0.45:  # was 0.35 — seek food earlier
             for obj in self.world.objects_at(self.pos):
                 if isinstance(obj, Food):
                     return {"tool": "consume", "args": {"item": obj.name},
                             "thought": "Need food urgently."}
-            # Move toward nearest food
-            nearby = self.world.objects_near(self.pos, radius=5)
+            # Move toward nearest food (larger search radius)
+            nearby = self.world.objects_near(self.pos, radius=8)  # was 6
             for dist, pos, obj in nearby:
                 if isinstance(obj, Food):
                     direction = self._direction_toward(pos)
                     if direction:
                         return {"tool": "move", "args": {"direction": direction},
                                 "thought": f"Food nearby, heading {direction}."}
+
+        # PRIORITY 3: Emergency water if low hydration
+        if self.hydration < 0.4:  # was 0.3 — seek water earlier
+            for obj in self.world.objects_at(self.pos):
+                if isinstance(obj, Water):
+                    return {"tool": "consume", "args": {"item": obj.name},
+                            "thought": "Need water urgently."}
+            # Move toward nearest water (larger search radius)
+            nearby = self.world.objects_near(self.pos, radius=8)  # was 6
+            for dist, pos, obj in nearby:
+                if isinstance(obj, Water):
+                    direction = self._direction_toward(pos)
+                    if direction:
+                        return {"tool": "move", "args": {"direction": direction},
+                                "thought": f"Water nearby, heading {direction}."}
 
         # Consume if standing on food/water
         for obj in self.world.objects_at(self.pos):
@@ -789,11 +1073,125 @@ class KosmosAgent:
         else:
             return "east" if dc > 0 else "west"
 
+    def _check_plan_interrupt(self) -> tuple[bool, str]:
+        """
+        Check if current plan should be interrupted.
+
+        Returns (should_interrupt, reason).
+        """
+        if not self._current_plan:
+            return False, ""
+
+        # Always interrupt in crisis zone
+        if self._consciousness_zone == "crisis":
+            return True, "crisis_zone"
+
+        # Check for hazard within 2 cells
+        nearby = self.world.objects_near(self.pos, radius=2)
+        for dist, _, obj in nearby:
+            if isinstance(obj, Hazard) and dist <= 2:
+                return True, "hazard_nearby"
+
+        # Check replan conditions
+        if "energy_critical" in self._plan_replan_if and self.energy < 0.2:
+            return True, "energy_critical"
+
+        if "goal_changed" in self._plan_replan_if and self.strategy != self._plan_strategy:
+            return True, "strategy_changed"
+
+        if "weather_change" in self._plan_replan_if:
+            if self._prev_weather and self.world.weather_name != self._prev_weather:
+                return True, "weather_change"
+
+        if "inventory_full" in self._plan_replan_if:
+            if len(self.inventory) >= self.inventory_capacity:
+                return True, "inventory_full"
+
+        return False, ""
+
+    def _should_fire_llm(self) -> tuple[bool, str]:
+        """
+        Check if a meaningful event warrants firing the LLM.
+
+        Returns (should_fire, reason).
+
+        Events that trigger LLM:
+        - Biome change (entered new environment)
+        - Strategy change (goal module shifted)
+        - Consciousness zone transition (crisis/struggling/healthy/transcendent)
+        - Weather change (new weather event or event ended)
+        - First discovery (first time seeing an object type)
+        - High entropy (cognitive turbulence, needs deliberation)
+        - Near-death experience (energy < 0.15)
+        - Periodic refresh (every 20-30 ticks to prevent staleness)
+        """
+        self._ticks_since_llm += 1
+
+        # Current state
+        current_biome = self.world.biomes[self.pos].value
+        current_weather = self.world.weather_name
+        current_zone = self._consciousness_zone
+        current_strategy = self.strategy
+
+        reasons = []
+
+        # 1. Biome change
+        if self._prev_biome is not None and current_biome != self._prev_biome:
+            reasons.append(f"entered {current_biome}")
+
+        # 2. Strategy change
+        if self._prev_strategy is not None and current_strategy != self._prev_strategy:
+            reasons.append(f"strategy shift to {current_strategy}")
+
+        # 3. Zone transition
+        if self._prev_zone is not None and current_zone != self._prev_zone:
+            reasons.append(f"zone transition to {current_zone}")
+
+        # 4. Weather change
+        if self._prev_weather is not None and current_weather != self._prev_weather:
+            if current_weather == "clear":
+                reasons.append("weather cleared")
+            else:
+                reasons.append(f"{current_weather} started")
+
+        # 5. First discovery — check objects at current position
+        for obj in self.world.objects_at(self.pos):
+            obj_type = type(obj).__name__
+            if obj_type not in self._seen_objects:
+                self._seen_objects.add(obj_type)
+                reasons.append(f"discovered {obj.name}")
+
+        # 6. High entropy (cognitive turbulence)
+        if self.entropy > 0.75:
+            reasons.append("high entropy")
+
+        # 7. Near-death experience
+        if self.energy < 0.15:
+            reasons.append("near-death")
+
+        # Update state for next tick
+        self._prev_biome = current_biome
+        self._prev_strategy = current_strategy
+        self._prev_zone = current_zone
+        self._prev_weather = current_weather
+
+        # 8. Periodic refresh (force every 25 ticks to prevent staleness)
+        if not reasons and self._ticks_since_llm >= 25:
+            reasons.append("periodic refresh")
+
+        if reasons:
+            self._ticks_since_llm = 0
+            reason_str = ", ".join(reasons)
+            self._last_significant_event = reason_str
+            return True, reason_str
+
+        return False, ""
+
     def _respawn(self):
         """Respawn after death. Keep memories, lose inventory."""
         self.pos = (self.world.size // 2, self.world.size // 2)
-        self.energy = 0.8
-        self.hydration = 0.8
+        self.energy = 1.0  # was 0.8 — full energy for fresh start
+        self.hydration = 1.0  # was 0.8
         self.alive = True
         self.inventory.clear()
         self.crafted.clear()
@@ -835,4 +1233,11 @@ class KosmosAgent:
             "learned_ema": self._learned_reward_ema,
             "heuristic_ema": self._heuristic_reward_ema,
             "weather": self.world.weather_name,
+            "consciousness_zone": self._consciousness_zone,
+            "llm_trigger": self._last_significant_event,
+            "ticks_since_llm": self._ticks_since_llm,
+            "goal_satisfaction": self._goal_satisfaction,
+            "novelty": self._novelty,
+            "plan_goal": self._plan_goal,
+            "plan_steps_remaining": len(self._current_plan),
         }

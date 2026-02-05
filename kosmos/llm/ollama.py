@@ -207,6 +207,145 @@ class OllamaReasoner:
         except Exception:
             return ""
 
+    def reason_plan(
+        self,
+        situation: str,
+        tools: list[dict],
+        strategy: str,
+        entropy: float,
+        energy: float,
+        inventory: list[str],
+        memory_hits: list[str] | None = None,
+        last_result: str = "",
+    ) -> dict:
+        """
+        Ask the LLM to produce a multi-step plan (3-5 actions).
+
+        Returns: {
+            "plan": [{"tool": "...", "args": {...}, "thought": "..."}],
+            "goal": "description of what the plan achieves",
+            "replan_if": ["condition1", "condition2", ...]
+        }
+        """
+        temperature = 0.3 + entropy * 0.8  # Slightly lower for planning
+
+        personality = {
+            "explore": "You are curious and adventurous. Seek the unknown.",
+            "exploit": "You are efficient and focused. Get what you need directly.",
+            "rest": "You are tired and cautious. Conserve energy. Rest if safe.",
+            "learn": "You are analytical. Examine things. Gather information.",
+            "social": "You are sociable. Look for others. Communicate.",
+        }.get(strategy, "You are a survivor. Stay alive.")
+
+        tool_list = "\n".join(
+            f"- {t['name']}: {t['description']} "
+            f"(params: {', '.join(t['parameters'].keys()) if t['parameters'] else 'none'})"
+            for t in tools
+        )
+
+        inv_str = ", ".join(inventory) if inventory else "empty"
+        mem_str = ""
+        if memory_hits:
+            mem_str = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memory_hits[:3])
+
+        system = (
+            f"{personality}\n\n"
+            f"You are a small creature trying to survive in a wild world. "
+            f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}\n\n"
+            f"Available tools:\n{tool_list}\n\n"
+            f"Create a SHORT PLAN (2-4 steps) to achieve a goal. "
+            f"Respond ONLY with valid JSON in this exact format:\n"
+            f'{{"plan": [{{"tool": "name", "args": {{}}, "thought": "why"}}], '
+            f'"goal": "what the plan achieves", '
+            f'"replan_if": ["condition1"]}}\n\n'
+            f"Valid replan_if conditions: energy_critical, hazard_nearby, "
+            f"goal_changed, inventory_full, target_gone, weather_change\n"
+            f"Keep plans short and achievable. Focus on immediate survival needs first."
+        )
+
+        user_content = situation
+        if last_result:
+            user_content = f"Previous action result: {last_result}\n\n{situation}"
+
+        messages = [{"role": "system", "content": system}]
+        messages.append({"role": "user", "content": user_content})
+
+        try:
+            resp = requests.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "options": {"temperature": float(temperature)},
+                    "stream": False,
+                    "format": "json",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            content = resp.json().get("message", {}).get("content", "")
+            return self._parse_plan_response(content, strategy, energy)
+        except requests.ConnectionError:
+            return self._fallback_plan(strategy, energy)
+        except Exception:
+            return self._fallback_plan(strategy, energy)
+
+    def _parse_plan_response(self, content: str, strategy: str, energy: float) -> dict:
+        """Parse LLM plan response."""
+        try:
+            data = json.loads(content)
+            plan = data.get("plan", [])
+            # Validate plan structure
+            if not plan or not isinstance(plan, list):
+                return self._fallback_plan(strategy, energy)
+            # Validate each step
+            valid_plan = []
+            for step in plan[:5]:  # Max 5 steps
+                if isinstance(step, dict) and "tool" in step:
+                    valid_plan.append({
+                        "tool": step.get("tool", "wait"),
+                        "args": step.get("args", {}),
+                        "thought": step.get("thought", ""),
+                    })
+            if not valid_plan:
+                return self._fallback_plan(strategy, energy)
+            return {
+                "plan": valid_plan,
+                "goal": data.get("goal", "survive"),
+                "replan_if": data.get("replan_if", ["energy_critical", "hazard_nearby"]),
+            }
+        except (json.JSONDecodeError, KeyError):
+            return self._fallback_plan(strategy, energy)
+
+    def _fallback_plan(self, strategy: str, energy: float) -> dict:
+        """Fallback plan when LLM is unavailable."""
+        if energy < 0.3:
+            return {
+                "plan": [
+                    {"tool": "examine", "args": {"target": "surroundings"}, "thought": "Look for food"},
+                    {"tool": "rest", "args": {}, "thought": "Conserve energy"},
+                ],
+                "goal": "find food and rest",
+                "replan_if": ["energy_critical"],
+            }
+        if strategy == "explore":
+            return {
+                "plan": [
+                    {"tool": "move", "args": {"direction": "north"}, "thought": "Explore north"},
+                    {"tool": "examine", "args": {"target": "surroundings"}, "thought": "Survey area"},
+                    {"tool": "move", "args": {"direction": "east"}, "thought": "Continue exploring"},
+                ],
+                "goal": "explore new territory",
+                "replan_if": ["hazard_nearby", "goal_changed"],
+            }
+        return {
+            "plan": [
+                {"tool": "examine", "args": {"target": "surroundings"}, "thought": "Look around"},
+            ],
+            "goal": "assess situation",
+            "replan_if": ["energy_critical"],
+        }
+
     def _parse_response(self, content: str) -> dict:
         """Parse LLM JSON response into tool call."""
         try:

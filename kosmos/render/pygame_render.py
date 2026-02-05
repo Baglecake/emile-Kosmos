@@ -44,7 +44,16 @@ GOAL_COLORS = {
 DECISION_COLORS = {
     "teacher_llm": (80, 160, 80),
     "teacher_heuristic": (160, 160, 80),
+    "teacher_plan": (80, 180, 180),  # Cyan for plan execution
     "learned": (120, 80, 220),
+    "survival_reflex": (220, 60, 60),  # Red for crisis mode
+}
+
+ZONE_COLORS = {
+    "crisis": (220, 60, 60),      # Red
+    "struggling": (220, 160, 60), # Orange
+    "healthy": (80, 180, 80),     # Green
+    "transcendent": (120, 180, 220),  # Light blue
 }
 
 AGENT_COLOR = (240, 220, 60)
@@ -357,6 +366,25 @@ class KosmosRenderer:
         source = state.get("decision_source", "teacher")
         src_color = DECISION_COLORS.get(source, TEXT_DIM)
         self._text(panel_x, y, f"Deciding: {source}", self.font_sm, src_color)
+        y += 15
+
+        # Consciousness zone
+        zone = state.get("consciousness_zone", "healthy")
+        zone_color = ZONE_COLORS.get(zone, TEXT_DIM)
+        self._text(panel_x, y, f"Zone: {zone}", self.font_sm, zone_color)
+        y += 15
+
+        # Plan info (5e: multi-step planning)
+        plan_goal = state.get("plan_goal", "")
+        plan_steps = state.get("plan_steps_remaining", 0)
+        if plan_goal:
+            # Truncate long goals
+            if len(plan_goal) > 25:
+                plan_goal = plan_goal[:22] + "..."
+            plan_color = (140, 180, 200) if plan_steps > 0 else TEXT_DIM
+            self._text(panel_x, y, f"Plan: {plan_goal} ({plan_steps})", self.font_sm, plan_color)
+        else:
+            self._text(panel_x, y, "Plan: none", self.font_sm, TEXT_DIM)
         y += 16
 
         # Context
@@ -395,6 +423,18 @@ class KosmosRenderer:
                        (180, 120, 220), (60, 60, 80))
         y += 22
 
+        # Goal satisfaction bar (5c: surplus-faucet)
+        goal_sat = state.get("goal_satisfaction", 0.5)
+        self._draw_bar(panel_x, y, "GoalSat", goal_sat,
+                       (80, 200, 140), (200, 80, 80))
+        y += 22
+
+        # Novelty bar (5d: information metabolism)
+        novelty = state.get("novelty", 0.5)
+        self._draw_bar(panel_x, y, "Novelty", novelty,
+                       (140, 180, 220), (100, 80, 60))
+        y += 22
+
         # Teacher probability bar
         teacher_prob = state.get("teacher_prob", 1.0)
         self._draw_bar(panel_x, y, "Teacher", teacher_prob,
@@ -408,7 +448,19 @@ class KosmosRenderer:
         llm_str = f"LLM: {self.agent.llm.model}" if state["use_llm"] else "LLM: offline (heuristic)"
         self._text(panel_x, y, llm_str, self.font_sm,
                    (80, 160, 80) if state["use_llm"] else (160, 80, 80))
-        y += 22
+        y += 16
+
+        # LLM trigger (5b: event-triggered LLM)
+        trigger = state.get("llm_trigger", "")
+        ticks_since = state.get("ticks_since_llm", 0)
+        if trigger:
+            # Truncate if too long
+            if len(trigger) > 28:
+                trigger = trigger[:25] + "..."
+            self._text(panel_x, y, f"LLM: {trigger}", self.font_sm, (100, 180, 140))
+        else:
+            self._text(panel_x, y, f"LLM idle ({ticks_since})", self.font_sm, TEXT_DIM)
+        y += 20
 
         # Stats
         self._text(panel_x, y, "-- Stats --", self.font_sm, TEXT_MED)
