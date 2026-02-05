@@ -25,6 +25,7 @@ from .action_policy import (
     KOSMOS_ACTIONS,
 )
 from .demo_buffer import DemonstrationBuffer, behavior_cloning_update
+from .surplus_tension import SurplusTensionModule
 
 
 DIRECTIONS = {
@@ -193,6 +194,10 @@ class KosmosAgent:
 
         # Food memory for improved survival
         self._last_known_food_pos: tuple | None = None  # Last position where food was seen
+
+        # Phase 6: Surplus/Tension Module (principled QSE metrics)
+        self.surplus_tension = SurplusTensionModule()
+        self._st_metrics: dict = {}  # Latest surplus/tension metrics
 
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
@@ -653,6 +658,8 @@ class KosmosAgent:
 
             # Mark recent demos as death-leading
             self.demo_buffer.on_death()
+            # Record death for surplus/tension curvature calculation
+            self.surplus_tension.record_death(self.total_ticks)
             self.last_thought = "Everything fades..."
             if self.goal_mapper is not None:
                 self.goal_mapper.reset_episode()
@@ -683,7 +690,25 @@ class KosmosAgent:
         # 4. Build situation description
         situation = self._build_situation()
 
-        # 4.5 Consciousness zone classification (for survival override)
+        # 4.5 Phase 6: Surplus/Tension computation
+        self._st_metrics = self.surplus_tension.step(self)
+
+        # Check for rupture (Phase 6c - escape death traps)
+        if self._st_metrics.get("should_rupture", False):
+            print(f"[RUPTURE t={self.total_ticks}] Σ={self._st_metrics['sigma_ema']:.2f} "
+                  f"pos={self.pos} ruptures={self.surplus_tension.ruptures_triggered}")
+            # Clear current plan and force replan
+            self._current_plan.clear()
+            self._plan_goal = ""
+            # Mark stuckness to trigger escape behavior in heuristic
+            self._is_stuck = True
+            self._stuck_ticks = 10  # Force escape
+            # Reset internal model for fresh start
+            self.surplus_tension.on_rupture()
+            # Force LLM call for new plan
+            self._ticks_since_llm = 999
+
+        # 4.6 Consciousness zone classification (for survival override)
         # Crisis: force heuristic survival actions, no learned policy
         # Struggling: bias toward teacher, slow decay
         # Healthy: normal teacher-student balance
@@ -914,12 +939,14 @@ class KosmosAgent:
         # Console logging every 100 ticks
         if self.total_ticks % 100 == 0:
             teacher_count = self.total_ticks - self._learned_samples
+            st = self._st_metrics
             print(
                 f"[t={self.total_ticks}] zone={self._consciousness_zone} "
                 f"teacher_prob={self._teacher_prob:.3f} "
                 f"teacher={teacher_count} learned={self._learned_samples} "
                 f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f} "
-                f"death_rate={self._death_rate_ema:.1f}"
+                f"death_rate={self._death_rate_ema:.1f} "
+                f"S={st.get('surplus_ema', 0):.2f} Σ={st.get('sigma_ema', 0):.2f} τ′={st.get('tau_prime', 1):.2f}"
             )
 
         # 11. Surplus-faucet goal pressure (5c)
@@ -1355,19 +1382,18 @@ class KosmosAgent:
 
     def _should_fire_llm(self) -> tuple[bool, str]:
         """
-        Check if a meaningful event warrants firing the LLM.
+        Check if LLM should be invoked based on τ′-scaled scheduling (Phase 6b).
 
         Returns (should_fire, reason).
 
-        Events that trigger LLM:
-        - Biome change (entered new environment)
-        - Strategy change (goal module shifted)
-        - Consciousness zone transition (crisis/struggling/healthy/transcendent)
-        - Weather change (new weather event or event ended)
-        - First discovery (first time seeing an object type)
-        - High entropy (cognitive turbulence, needs deliberation)
-        - Near-death experience (energy < 0.15)
-        - Periodic refresh (every 20-30 ticks to prevent staleness)
+        Phase 6b replaces fixed periodic refresh with τ′-scaled timing:
+        - base_interval = 25 ticks
+        - effective_interval = base_interval * τ′
+        - High Σ (tension) → low τ′ → more frequent LLM calls
+        - Low Σ (calm) → high τ′ → less frequent LLM calls
+
+        Critical events still trigger immediately:
+        - Zone transitions, near-death, high curvature, first discoveries
         """
         self._ticks_since_llm += 1
 
@@ -1379,43 +1405,55 @@ class KosmosAgent:
 
         reasons = []
 
-        # 1. Biome change
-        if self._prev_biome is not None and current_biome != self._prev_biome:
-            reasons.append(f"entered {current_biome}")
+        # === Critical events (always trigger immediately) ===
 
-        # 2. Strategy change
-        if self._prev_strategy is not None and current_strategy != self._prev_strategy:
-            reasons.append(f"strategy shift to {current_strategy}")
-
-        # 3. Zone transition
+        # 1. Zone transition (crisis/struggling/healthy/transcendent)
         if self._prev_zone is not None and current_zone != self._prev_zone:
             reasons.append(f"zone transition to {current_zone}")
 
-        # 4. Weather change
-        if self._prev_weather is not None and current_weather != self._prev_weather:
-            if current_weather == "clear":
-                reasons.append("weather cleared")
-            else:
-                reasons.append(f"{current_weather} started")
+        # 2. Near-death experience
+        if self.energy < 0.15:
+            reasons.append("near-death")
 
-        # 5. First discovery — check objects at current position
+        # 3. High curvature Σ (Phase 6: structured tension warrants deliberation)
+        sigma_ema = self._st_metrics.get("sigma_ema", 0)
+        if sigma_ema > 0.5:  # Elevated tension but below rupture threshold
+            reasons.append(f"high tension (Σ={sigma_ema:.2f})")
+
+        # 4. First discovery — novel object types
         for obj in self.world.objects_at(self.pos):
             obj_type = type(obj).__name__
             if obj_type not in self._seen_objects:
                 self._seen_objects.add(obj_type)
                 reasons.append(f"discovered {obj.name}")
 
-        # 6. High entropy (cognitive turbulence)
-        if self.entropy > 0.75:
-            reasons.append("high entropy")
+        # === Secondary events (trigger if no critical events) ===
 
-        # 7. Near-death experience
-        if self.energy < 0.15:
-            reasons.append("near-death")
+        if not reasons:
+            # 5. Biome change
+            if self._prev_biome is not None and current_biome != self._prev_biome:
+                reasons.append(f"entered {current_biome}")
 
-        # 8. Stuckness triggers replanning (5g)
-        if self._is_stuck and self._stuck_ticks >= 5:
-            reasons.append("stuck in area")
+            # 6. Strategy change
+            if self._prev_strategy is not None and current_strategy != self._prev_strategy:
+                reasons.append(f"strategy shift to {current_strategy}")
+
+            # 7. Weather change
+            if self._prev_weather is not None and current_weather != self._prev_weather:
+                if current_weather == "clear":
+                    reasons.append("weather cleared")
+                else:
+                    reasons.append(f"{current_weather} started")
+
+            # 8. High entropy removed - τ′-scheduling via Σ handles cognitive tension
+            # The QSE naturally runs high entropy (mean ~0.9), making this trigger
+            # too sensitive. Curvature Σ is a better measure of cognitive tension.
+            # if self.entropy > 0.92:
+            #     reasons.append("high entropy")
+
+            # 9. Stuckness triggers replanning
+            if self._is_stuck and self._stuck_ticks >= 5:
+                reasons.append("stuck in area")
 
         # Update state for next tick
         self._prev_biome = current_biome
@@ -1423,11 +1461,21 @@ class KosmosAgent:
         self._prev_zone = current_zone
         self._prev_weather = current_weather
 
-        # 8. Periodic refresh (force every 25 ticks to prevent staleness)
-        if not reasons and self._ticks_since_llm >= 25:
-            reasons.append("periodic refresh")
+        # === Phase 6b: τ′-scaled periodic refresh ===
+        # Instead of fixed 25 ticks, scale by emergent time τ′
+        # τ′ ∈ [0.5, 2.0]: high tension = shorter interval, low tension = longer
+        if not reasons:
+            tau_prime = self._st_metrics.get("tau_prime", 1.0)
+            base_interval = 25
+            effective_interval = base_interval * tau_prime
+            if self._ticks_since_llm >= effective_interval:
+                reasons.append(f"τ′-refresh (τ′={tau_prime:.2f})")
 
-        if reasons:
+        # Minimum cooldown: prevent excessive LLM calls from noisy triggers
+        # Critical events (zone transition, near-death) bypass this
+        MIN_LLM_INTERVAL = 5
+        is_critical = any(r for r in reasons if "zone transition" in r or "near-death" in r)
+        if reasons and (is_critical or self._ticks_since_llm >= MIN_LLM_INTERVAL):
             self._ticks_since_llm = 0
             reason_str = ", ".join(reasons)
             self._last_significant_event = reason_str
@@ -1495,4 +1543,11 @@ class KosmosAgent:
             # 5g: Stuckness detection
             "is_stuck": self._is_stuck,
             "stuck_ticks": self._stuck_ticks,
+            # Phase 6: Surplus/Tension
+            "surplus": self._st_metrics.get("surplus", 0),
+            "surplus_ema": self._st_metrics.get("surplus_ema", 0),
+            "curvature": self._st_metrics.get("curvature", 0),
+            "sigma_ema": self._st_metrics.get("sigma_ema", 0),
+            "tau_prime": self._st_metrics.get("tau_prime", 1.0),
+            "ruptures": self.surplus_tension.ruptures_triggered,
         }
