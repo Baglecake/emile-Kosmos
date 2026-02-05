@@ -191,6 +191,9 @@ class KosmosAgent:
         self._baseline_death_rate = 30.0  # Teacher's best death rate (frozen after warmup)
         self._baseline_frozen = False  # Freeze baseline at end of warmup
 
+        # Food memory for improved survival
+        self._last_known_food_pos: tuple | None = None  # Last position where food was seen
+
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
     # ------------------------------------------------------------------ #
@@ -326,6 +329,9 @@ class KosmosAgent:
                     energy_gain *= 1.3
                 self.energy = min(1.0, self.energy + energy_gain)
                 self.food_eaten += 1
+                # Clear food memory - we ate the food at this location
+                if self._last_known_food_pos == self.pos:
+                    self._last_known_food_pos = None
                 extra = ""
                 if isinstance(obj, Herb) and hasattr(obj, 'heal_value'):
                     extra = " Feeling better."
@@ -1150,14 +1156,27 @@ class KosmosAgent:
                 if isinstance(obj, Food):
                     return {"tool": "consume", "args": {"item": obj.name},
                             "thought": "Need food urgently."}
-            # Move toward nearest food (larger search radius)
-            nearby = self.world.objects_near(self.pos, radius=8)  # was 6
+            # Adaptive search radius: larger when more desperate
+            search_radius = 12 if self.energy < 0.30 else 8
+            nearby = self.world.objects_near(self.pos, radius=search_radius)
             for dist, pos, obj in nearby:
                 if isinstance(obj, Food):
+                    # Remember this food location for future reference
+                    self._last_known_food_pos = pos
                     direction = self._direction_toward(pos)
                     if direction:
                         return {"tool": "move", "args": {"direction": direction},
-                                "thought": f"Food nearby, heading {direction}."}
+                                "thought": f"Food at {pos}, heading {direction}."}
+            # No food in search radius - try last known food location
+            if self._last_known_food_pos:
+                # If we're at the remembered location but no food here, clear memory
+                if self._last_known_food_pos == self.pos:
+                    self._last_known_food_pos = None
+                else:
+                    direction = self._direction_toward(self._last_known_food_pos)
+                    if direction:
+                        return {"tool": "move", "args": {"direction": direction},
+                                "thought": f"Returning to last known food at {self._last_known_food_pos}."}
 
         # PRIORITY 3: Emergency water if low hydration
         if self.hydration < 0.4:  # was 0.3 — seek water earlier
