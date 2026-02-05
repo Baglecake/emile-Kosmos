@@ -159,6 +159,16 @@ class KosmosAgent:
         self._plan_strategy: str = ""  # strategy when plan was created
         self._use_planning = True  # enable/disable planning mode
 
+        # 5f: Anti-oscillation (from complete_navigation_system_e.py)
+        self._recent_actions: list[str] = []  # last N action names
+        self._action_repeat_window = 10  # how many actions to track
+
+        # 5g: Stuckness detection (from maze_environment.py)
+        self._stuckness_threshold = 3  # <= this many unique positions = stuck
+        self._stuckness_window = 20  # positions to consider
+        self._is_stuck = False
+        self._stuck_ticks = 0  # how long we've been stuck
+
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
     # ------------------------------------------------------------------ #
@@ -723,6 +733,10 @@ class KosmosAgent:
         # 7. Compute reward
         reward = self._compute_reward(tool_name, result)
 
+        # 7b. Apply anti-oscillation penalty (5f)
+        action_penalty = self._get_action_penalty(tool_name)
+        reward = reward - action_penalty
+
         # 8. Update L1: GoalModuleV2
         self.goal_module.update(reward, self.context, energy_for_goal)
 
@@ -812,6 +826,9 @@ class KosmosAgent:
         self._novelty = 0.9 * self._novelty + 0.1 * raw_novelty
         self._novelty = float(np.clip(self._novelty, 0.1, 0.9))
 
+        # 11c. Check for stuckness (5g)
+        self._check_stuckness()
+
         # Apply novelty-based energy modulation:
         # High novelty (exploring) = small energy bonus
         # Low novelty (camping) = small energy drain
@@ -825,6 +842,11 @@ class KosmosAgent:
         # 12. Feed modulated reward back to QSE
         with self._lock:
             self.emile.step(dt=0.005, external_input={"reward": qse_reward})
+
+        # 13. Track action for anti-oscillation (5f)
+        self._recent_actions.append(tool_name)
+        if len(self._recent_actions) > self._action_repeat_window:
+            self._recent_actions = self._recent_actions[-self._action_repeat_window:]
 
         self.last_action = {
             "tool": tool_name,
@@ -1014,6 +1036,15 @@ class KosmosAgent:
                 return {"tool": "pickup", "args": {"item": obj.name},
                         "thought": "Useful item."}
 
+        # If stuck, force random exploration to break out (5g)
+        if self._is_stuck and self._stuck_ticks >= 10:
+            dirs = ["north", "south", "east", "west"]
+            # Avoid current facing direction to encourage new paths
+            other_dirs = [d for d in dirs if d != self.facing]
+            direction = other_dirs[np.random.randint(len(other_dirs))]
+            return {"tool": "move", "args": {"direction": direction},
+                    "thought": "Breaking out of stuck area."}
+
         # Try crafting if we have 2+ items
         if len(self.inventory) >= 2:
             for i, a in enumerate(self.inventory):
@@ -1072,6 +1103,50 @@ class KosmosAgent:
             return "south" if dr > 0 else "north"
         else:
             return "east" if dc > 0 else "west"
+
+    def _get_action_penalty(self, action_name: str) -> float:
+        """
+        Calculate penalty for repeating an action (5f: anti-oscillation).
+
+        From complete_navigation_system_e.py: decay penalties for repeated actions
+        to encourage behavioral diversity and prevent oscillation.
+        """
+        if not self._recent_actions:
+            return 0.0
+        # Count how many times this action appears in recent history
+        recent_count = self._recent_actions.count(action_name)
+        # Exponential decay penalty: 0.05 * count^1.5
+        penalty = 0.05 * (recent_count ** 1.5)
+        return min(penalty, 0.5)  # Cap at 0.5 to avoid over-penalizing
+
+    def _check_stuckness(self) -> bool:
+        """
+        Check if agent is stuck (5g: stuckness detection).
+
+        From maze_environment.py: stuckness detection triggers context-switch
+        when agent revisits the same few positions repeatedly.
+        """
+        if len(self._recent_positions) < self._stuckness_window:
+            return False
+
+        recent = self._recent_positions[-self._stuckness_window:]
+        unique_positions = len(set(recent))
+
+        was_stuck = self._is_stuck
+        self._is_stuck = unique_positions <= self._stuckness_threshold
+
+        if self._is_stuck:
+            self._stuck_ticks += 1
+        else:
+            self._stuck_ticks = 0
+
+        # Log transition
+        if self._is_stuck and not was_stuck:
+            print(f"[STUCK t={self.total_ticks}] Agent stuck at {unique_positions} unique positions")
+        elif not self._is_stuck and was_stuck:
+            print(f"[UNSTUCK t={self.total_ticks}] Agent escaped stuckness")
+
+        return self._is_stuck
 
     def _check_plan_interrupt(self) -> tuple[bool, str]:
         """
@@ -1169,6 +1244,10 @@ class KosmosAgent:
         if self.energy < 0.15:
             reasons.append("near-death")
 
+        # 8. Stuckness triggers replanning (5g)
+        if self._is_stuck and self._stuck_ticks >= 5:
+            reasons.append("stuck in area")
+
         # Update state for next tick
         self._prev_biome = current_biome
         self._prev_strategy = current_strategy
@@ -1240,4 +1319,11 @@ class KosmosAgent:
             "novelty": self._novelty,
             "plan_goal": self._plan_goal,
             "plan_steps_remaining": len(self._current_plan),
+            # 5f: Anti-oscillation
+            "action_repeat_penalty": self._get_action_penalty(
+                self.last_action.get("tool", "") if self.last_action else ""
+            ),
+            # 5g: Stuckness detection
+            "is_stuck": self._is_stuck,
+            "stuck_ticks": self._stuck_ticks,
         }
