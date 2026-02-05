@@ -22,7 +22,9 @@ from .action_policy import (
     KosmosActionPolicy,
     action_to_tool_call,
     decision_to_action_name,
+    KOSMOS_ACTIONS,
 )
+from .demo_buffer import DemonstrationBuffer, behavior_cloning_update
 
 
 DIRECTIONS = {
@@ -172,6 +174,20 @@ class KosmosAgent:
         self._stuckness_window = 20  # positions to consider
         self._is_stuck = False
         self._stuck_ticks = 0  # how long we've been stuck
+
+        # Demonstration buffer for behavior cloning (consolidation)
+        # This is the "repetition + consolidation" that was missing
+        self.demo_buffer = DemonstrationBuffer(max_size=20000)
+        self._bc_train_interval = 200  # Train from demos every N ticks
+        self._bc_batch_size = 64
+        self._bc_learning_rate = 0.005
+
+        # Competence-based teacher decay tracking
+        self._death_rate_window: list[int] = []  # Recent death tick deltas
+        self._last_death_tick = 0
+        self._ticks_since_death = 0
+        self._death_rate_ema = 30.0  # Deaths per 1000 ticks (start pessimistic)
+        self._baseline_death_rate = 30.0  # Teacher's death rate (updated during warmup)
 
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
@@ -611,6 +627,22 @@ class KosmosAgent:
                   f"zone={self._consciousness_zone} hydration={self.hydration:.2f} deaths={self.deaths}")
             self._remember(f"Died of exhaustion at {self.pos}. Death #{self.deaths}.")
             self.last_action = {"tool": "death", "result": "Ran out of energy."}
+
+            # Update death rate tracking for competence-based decay
+            ticks_since_death = self.total_ticks - self._last_death_tick
+            self._death_rate_window.append(ticks_since_death)
+            if len(self._death_rate_window) > 20:
+                self._death_rate_window = self._death_rate_window[-20:]
+            self._last_death_tick = self.total_ticks
+            self._ticks_since_death = 0
+
+            # Update death rate EMA (deaths per 1000 ticks)
+            if ticks_since_death > 0:
+                instant_rate = 1000.0 / ticks_since_death
+                self._death_rate_ema = 0.9 * self._death_rate_ema + 0.1 * instant_rate
+
+            # Mark recent demos as death-leading
+            self.demo_buffer.on_death()
             self.last_thought = "Everything fades..."
             if self.goal_mapper is not None:
                 self.goal_mapper.reset_episode()
@@ -772,6 +804,23 @@ class KosmosAgent:
         action_penalty = self._get_action_penalty(granular_action_for_penalty)
         reward = reward - action_penalty
 
+        # 7c. Record teacher demonstrations for behavior cloning
+        # Only record when teacher (not learned policy) makes the decision
+        if not self._used_learned and granular_action_for_penalty in KOSMOS_ACTIONS:
+            state_dict = self._build_policy_state_dict()
+            self.demo_buffer.add(
+                state_dict=state_dict,
+                action_name=granular_action_for_penalty,
+                reward=reward,
+                source=self._decision_source,
+            )
+
+        # Track survival for competence evaluation
+        self._ticks_since_death += 1
+        # Update demo buffer with survival info periodically
+        if self.total_ticks % 50 == 0:
+            self.demo_buffer.update_survival(self._ticks_since_death)
+
         # 8. Update L1: GoalModuleV2
         self.goal_module.update(reward, self.context, energy_for_goal)
 
@@ -805,16 +854,44 @@ class KosmosAgent:
                     (1 - ema_alpha) * self._heuristic_reward_ema + ema_alpha * reward
                 )
 
-            # Performance-gated teacher decay
+            # Competence-based teacher decay (replaces time-based decay)
+            # Only reduce teacher probability when student is demonstrably competent
             decay = self.config.POLICY_TEACHER_DECAY
             floor = self.config.POLICY_TEACHER_MIN
-            warmup = getattr(self.config, 'POLICY_TEACHER_WARMUP', 500)
+            warmup = getattr(self.config, 'POLICY_TEACHER_WARMUP', 2000)
+
             if self._learned_samples < warmup:
-                self._teacher_prob = max(floor, self._teacher_prob * decay)
-            elif self._learned_reward_ema >= self._heuristic_reward_ema - 0.05:
-                self._teacher_prob = max(floor, self._teacher_prob * decay)
+                # During warmup: establish baseline, slow decay
+                # Update baseline death rate from teacher's performance
+                self._baseline_death_rate = 0.95 * self._baseline_death_rate + 0.05 * self._death_rate_ema
+                # Very slow decay during warmup
+                self._teacher_prob = max(floor, self._teacher_prob * 0.9999)
             else:
-                self._teacher_prob = min(1.0, self._teacher_prob / decay)
+                # After warmup: competence-gated decay
+                # Student is competent if:
+                # 1. Reward EMA is at least 90% of heuristic EMA
+                # 2. Death rate is not much worse than baseline
+                reward_competent = self._learned_reward_ema >= 0.9 * self._heuristic_reward_ema
+                survival_competent = self._death_rate_ema <= 1.2 * self._baseline_death_rate
+                min_samples_for_eval = warmup + 500  # Need enough samples to evaluate
+
+                if self._learned_samples >= min_samples_for_eval and reward_competent and survival_competent:
+                    # Student is competent - decay teacher
+                    self._teacher_prob = max(floor, self._teacher_prob * decay)
+                elif self._learned_samples >= min_samples_for_eval and not reward_competent:
+                    # Student struggling - slow recovery of teacher
+                    self._teacher_prob = min(1.0, self._teacher_prob * 1.001)
+                # else: stay at current level, student still learning
+
+            # Periodic behavior cloning from demo buffer
+            if self.total_ticks % self._bc_train_interval == 0 and len(self.demo_buffer) >= self._bc_batch_size:
+                demos = self.demo_buffer.sample(self._bc_batch_size, weighted=True)
+                bc_stats = behavior_cloning_update(
+                    self.action_policy, demos, learning_rate=self._bc_learning_rate
+                )
+                if self.total_ticks % 1000 == 0:
+                    print(f"[BC t={self.total_ticks}] loss={bc_stats['loss']:.3f} "
+                          f"acc={bc_stats['accuracy']:.2f} demos={len(self.demo_buffer)}")
 
         # Console logging every 100 ticks
         if self.total_ticks % 100 == 0:
@@ -823,7 +900,8 @@ class KosmosAgent:
                 f"[t={self.total_ticks}] zone={self._consciousness_zone} "
                 f"teacher_prob={self._teacher_prob:.3f} "
                 f"teacher={teacher_count} learned={self._learned_samples} "
-                f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f}"
+                f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f} "
+                f"death_rate={self._death_rate_ema:.1f}"
             )
 
         # 11. Surplus-faucet goal pressure (5c)
