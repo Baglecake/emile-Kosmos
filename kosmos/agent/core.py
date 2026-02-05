@@ -889,9 +889,10 @@ class KosmosAgent:
                 if self._learned_samples >= min_samples_for_eval and reward_competent and survival_competent:
                     # Student is competent - decay teacher
                     self._teacher_prob = max(floor, self._teacher_prob * decay)
-                elif self._learned_samples >= min_samples_for_eval and not reward_competent:
-                    # Student struggling - slow recovery of teacher
-                    self._teacher_prob = min(1.0, self._teacher_prob * 1.001)
+                elif self._learned_samples >= min_samples_for_eval and not survival_competent:
+                    # Student failing survival - slow recovery of teacher
+                    # But cap at 0.85 so student always gets ~15% of decisions to keep learning
+                    self._teacher_prob = min(0.85, self._teacher_prob * 1.0005)
                 # else: stay at current level, student still learning
 
             # Periodic behavior cloning from demo buffer
