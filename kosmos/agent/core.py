@@ -715,14 +715,18 @@ class KosmosAgent:
 
         # Check for rupture (Phase 6c - escape death traps)
         if self._st_metrics.get("should_rupture", False):
+            k_eff = self._st_metrics.get('k_effective', 2.0)
             print(f"[RUPTURE t={self.total_ticks}] Σ={self._st_metrics['sigma_ema']:.2f} "
-                  f"pos={self.pos} ruptures={self.surplus_tension.ruptures_triggered}")
+                  f"k={k_eff:.1f} pos={self.pos} ruptures={self.surplus_tension.ruptures_triggered}")
             # Clear current plan and force replan
             self._current_plan.clear()
             self._plan_goal = ""
             # Mark stuckness to trigger escape behavior in heuristic
             self._is_stuck = True
             self._stuck_ticks = 10  # Force escape
+            # Reset strategy dwell to allow immediate strategy pivot
+            self._strategy_dwell_ticks = 0
+            self._pending_strategy = None
             # Reset internal model for fresh start
             self.surplus_tension.on_rupture()
             # Force LLM call for new plan
@@ -961,13 +965,14 @@ class KosmosAgent:
             teacher_count = self.total_ticks - self._learned_samples
             st = self._st_metrics
             thresh = st.get('dynamic_threshold', 0.65)
+            k_eff = st.get('k_effective', 2.0)
             print(
                 f"[t={self.total_ticks}] zone={self._consciousness_zone} "
                 f"teacher_prob={self._teacher_prob:.3f} "
                 f"teacher={teacher_count} learned={self._learned_samples} "
                 f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f} "
                 f"death_rate={self._death_rate_ema:.1f} "
-                f"S={st.get('surplus_ema', 0):.2f} Σ={st.get('sigma_ema', 0):.2f}/{thresh:.2f} τ′={st.get('tau_prime', 1):.2f}"
+                f"S={st.get('surplus_ema', 0):.2f} Σ={st.get('sigma_ema', 0):.2f}/{thresh:.2f} k={k_eff:.1f} τ′={st.get('tau_prime', 1):.2f}"
             )
 
         # 11. Surplus-faucet goal pressure (5c)
@@ -1571,5 +1576,6 @@ class KosmosAgent:
             "sigma_ema": self._st_metrics.get("sigma_ema", 0),
             "tau_prime": self._st_metrics.get("tau_prime", 1.0),
             "dynamic_threshold": self._st_metrics.get("dynamic_threshold", 0.65),
+            "k_effective": self._st_metrics.get("k_effective", 2.0),
             "ruptures": self.surplus_tension.ruptures_triggered,
         }

@@ -226,6 +226,8 @@ class SurplusTensionModule:
         self.rupture_cooldown = 0
         self.ruptures_triggered = 0
         self._last_dynamic_threshold = 0.65  # Track for monitoring
+        self._current_tick = 0  # Updated each step for death-sensitive k
+        self._last_k_effective = 2.0  # Track for monitoring
 
         # Configuration
         self.SIGMA_CRIT = 0.65        # Initial/fallback threshold (used during warmup)
@@ -246,6 +248,9 @@ class SurplusTensionModule:
         - tau_prime: emergent time scaling for LLM
         - should_rupture: whether to trigger rupture behavior
         """
+        # Track current tick for death-sensitive k calculation
+        self._current_tick = agent.total_ticks
+
         # Build observation vectors
         phi = build_phi(agent)
         psi = self.internal_model.build_psi()
@@ -292,6 +297,7 @@ class SurplusTensionModule:
             "tau_prime": tau_prime,
             "should_rupture": should_rupture,
             "dynamic_threshold": self._last_dynamic_threshold,
+            "k_effective": self._last_k_effective,
             "phi": phi,
             "psi": psi,
         }
@@ -317,10 +323,20 @@ class SurplusTensionModule:
         of curvature the agent has experienced. Rupture triggers when curvature
         exceeds the agent's baseline by a significant margin.
 
-        threshold = mean(recent_sigma) + k * std(recent_sigma)
+        threshold = mean(recent_sigma) + k_effective * std(recent_sigma)
 
-        This ensures the threshold is relative to the agent's own dynamics,
-        not an arbitrary constant.
+        Death-Sensitive k (prevents "Normalization of Deviance"):
+        When deaths cluster, the curvature history rises (due to death_factor
+        in compute_curvature). This would normally raise the threshold along
+        with the tension, preventing ruptures precisely when needed most.
+
+        To counter this, k decreases when recent deaths are detected:
+        - k_base = 2.0 (conservative, ~95th percentile)
+        - k drops by 0.5 per recent death (within 200 ticks)
+        - k_min = 0.5 (still requires some deviation)
+
+        This ensures ruptures become MORE likely when survival is deteriorating,
+        not LESS likely as the "death trap" becomes the new normal.
         """
         min_history = 50  # Need enough samples for meaningful statistics
         if len(self.curvature_history) < min_history:
@@ -330,10 +346,24 @@ class SurplusTensionModule:
         sigma_mean = float(np.mean(recent))
         sigma_std = float(np.std(recent))
 
-        # k = 2.0 means rupture at ~95th percentile of normal distribution
-        # This is a principled statistical threshold, not arbitrary
-        k = 2.0
-        dynamic_threshold = sigma_mean + k * sigma_std
+        # Death-sensitive k: lower threshold when deaths are clustering
+        k_base = 2.0
+        k_min = 0.5
+        death_window = 200  # Same window used in compute_curvature
+
+        # Count deaths within recent window
+        recent_deaths = sum(
+            1 for t in self.death_ticks
+            if self._current_tick - t < death_window
+        )
+
+        # Each recent death drops k by 0.5
+        # 0 deaths: k=2.0, 1 death: k=1.5, 2 deaths: k=1.0, 3+ deaths: k=0.5
+        death_penalty = 0.5 * recent_deaths
+        k_effective = max(k_min, k_base - death_penalty)
+        self._last_k_effective = k_effective  # Track for monitoring
+
+        dynamic_threshold = sigma_mean + k_effective * sigma_std
 
         # Floor: don't let threshold drop below a minimum
         # (prevents triggering on tiny fluctuations when everything is calm)
