@@ -225,9 +225,10 @@ class SurplusTensionModule:
         # Rupture state
         self.rupture_cooldown = 0
         self.ruptures_triggered = 0
+        self._last_dynamic_threshold = 0.65  # Track for monitoring
 
         # Configuration
-        self.SIGMA_CRIT = 0.65        # Rupture threshold (tuned down from 0.7)
+        self.SIGMA_CRIT = 0.65        # Initial/fallback threshold (used during warmup)
         self.TAU_MIN = 0.5            # Min LLM interval scaling (faster)
         self.TAU_MAX = 2.0            # Max LLM interval scaling (slower)
         self.RUPTURE_COOLDOWN = 50    # Ticks between ruptures
@@ -290,6 +291,7 @@ class SurplusTensionModule:
             "sigma_ema": self.sigma_ema,
             "tau_prime": tau_prime,
             "should_rupture": should_rupture,
+            "dynamic_threshold": self._last_dynamic_threshold,
             "phi": phi,
             "psi": psi,
         }
@@ -307,19 +309,57 @@ class SurplusTensionModule:
         tau_prime = self.TAU_MAX - (self.TAU_MAX - self.TAU_MIN) * self.sigma_ema
         return float(np.clip(tau_prime, self.TAU_MIN, self.TAU_MAX))
 
+    def _compute_dynamic_threshold(self) -> float:
+        """
+        Compute adaptive rupture threshold from agent's own curvature statistics.
+
+        Instead of a fixed SIGMA_CRIT, the threshold adapts to the distribution
+        of curvature the agent has experienced. Rupture triggers when curvature
+        exceeds the agent's baseline by a significant margin.
+
+        threshold = mean(recent_sigma) + k * std(recent_sigma)
+
+        This ensures the threshold is relative to the agent's own dynamics,
+        not an arbitrary constant.
+        """
+        min_history = 50  # Need enough samples for meaningful statistics
+        if len(self.curvature_history) < min_history:
+            return self.SIGMA_CRIT  # Fall back to initial value during warmup
+
+        recent = np.array(self.curvature_history[-min_history:])
+        sigma_mean = float(np.mean(recent))
+        sigma_std = float(np.std(recent))
+
+        # k = 2.0 means rupture at ~95th percentile of normal distribution
+        # This is a principled statistical threshold, not arbitrary
+        k = 2.0
+        dynamic_threshold = sigma_mean + k * sigma_std
+
+        # Floor: don't let threshold drop below a minimum
+        # (prevents triggering on tiny fluctuations when everything is calm)
+        min_threshold = 0.3
+        return max(dynamic_threshold, min_threshold)
+
     def _check_rupture(self) -> bool:
         """
-        Check if rupture threshold exceeded.
+        Check if rupture threshold exceeded using adaptive threshold.
 
         Rupture occurs when:
-        1. Curvature EMA exceeds critical threshold
+        1. Curvature EMA exceeds dynamic threshold (mean + k*std)
         2. Not in cooldown from previous rupture
+
+        The threshold adapts to the agent's own curvature distribution,
+        making ruptures context-sensitive rather than fixed.
         """
         if self.rupture_cooldown > 0:
             self.rupture_cooldown -= 1
             return False
 
-        if self.sigma_ema > self.SIGMA_CRIT:
+        # Compute dynamic threshold from curvature statistics
+        dynamic_threshold = self._compute_dynamic_threshold()
+        self._last_dynamic_threshold = dynamic_threshold  # Store for monitoring
+
+        if self.sigma_ema > dynamic_threshold:
             self.rupture_cooldown = self.RUPTURE_COOLDOWN
             self.ruptures_triggered += 1
             return True

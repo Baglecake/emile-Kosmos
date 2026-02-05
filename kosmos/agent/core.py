@@ -152,6 +152,11 @@ class KosmosAgent:
         self._ticks_since_llm = 0  # force periodic refresh
         self._last_significant_event: str = ""  # what triggered the LLM call
 
+        # Phase 6b: Strategy dwell time (reduce oscillation for τ′-scheduling)
+        self._strategy_dwell_ticks = 0  # How long current strategy has been held
+        self._min_strategy_dwell = 10   # Minimum ticks before strategy can change
+        self._pending_strategy: Optional[str] = None  # Strategy waiting to be adopted
+
         # 5c: Surplus-faucet goal pressure
         self._goal_satisfaction = 0.5  # EMA of recent goal achievement
         self._recent_rewards: list[float] = []  # last N rewards for satisfaction calc
@@ -675,8 +680,23 @@ class KosmosAgent:
         self.entropy = float(np.clip(result.get("normalized_entropy", 0.5), 0.05, 0.95))
         energy_for_goal = self.emile.body.state.energy if hasattr(self.emile, "body") else 0.5
 
-        # 2. L1: Strategy selection
-        self.strategy = self.goal_module.select_goal(self.context, energy_for_goal, self.entropy)
+        # 2. L1: Strategy selection with dwell time (reduces oscillation)
+        proposed_strategy = self.goal_module.select_goal(self.context, energy_for_goal, self.entropy)
+
+        # Enforce minimum dwell time to reduce strategy oscillation
+        # This allows τ′-scheduling to work without constant strategy-change triggers
+        self._strategy_dwell_ticks += 1
+        if proposed_strategy != self.strategy:
+            # Strategy wants to change
+            if self._strategy_dwell_ticks >= self._min_strategy_dwell:
+                # Dwell time met - allow change
+                self.strategy = proposed_strategy
+                self._strategy_dwell_ticks = 0
+            else:
+                # Store pending strategy (for monitoring)
+                self._pending_strategy = proposed_strategy
+        else:
+            self._pending_strategy = None
 
         # 3. L2: GoalMapper -> embodied goal
         if self.goal_mapper is not None:
@@ -940,13 +960,14 @@ class KosmosAgent:
         if self.total_ticks % 100 == 0:
             teacher_count = self.total_ticks - self._learned_samples
             st = self._st_metrics
+            thresh = st.get('dynamic_threshold', 0.65)
             print(
                 f"[t={self.total_ticks}] zone={self._consciousness_zone} "
                 f"teacher_prob={self._teacher_prob:.3f} "
                 f"teacher={teacher_count} learned={self._learned_samples} "
                 f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f} "
                 f"death_rate={self._death_rate_ema:.1f} "
-                f"S={st.get('surplus_ema', 0):.2f} Σ={st.get('sigma_ema', 0):.2f} τ′={st.get('tau_prime', 1):.2f}"
+                f"S={st.get('surplus_ema', 0):.2f} Σ={st.get('sigma_ema', 0):.2f}/{thresh:.2f} τ′={st.get('tau_prime', 1):.2f}"
             )
 
         # 11. Surplus-faucet goal pressure (5c)
@@ -1549,5 +1570,6 @@ class KosmosAgent:
             "curvature": self._st_metrics.get("curvature", 0),
             "sigma_ema": self._st_metrics.get("sigma_ema", 0),
             "tau_prime": self._st_metrics.get("tau_prime", 1.0),
+            "dynamic_threshold": self._st_metrics.get("dynamic_threshold", 0.65),
             "ruptures": self.surplus_tension.ruptures_triggered,
         }
