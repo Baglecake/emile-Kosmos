@@ -18,7 +18,11 @@ from ..world.weather import WeatherType
 from ..tools.registry import ToolRegistry
 from ..tools.builtins import get_builtin_tools
 from ..llm.ollama import OllamaReasoner
-from .action_policy import KosmosActionPolicy, action_to_tool_call
+from .action_policy import (
+    KosmosActionPolicy,
+    action_to_tool_call,
+    decision_to_action_name,
+)
 
 
 DIRECTIONS = {
@@ -522,6 +526,31 @@ class KosmosAgent:
             if can_craft:
                 break
 
+        # Compute directional cues to nearest food and hazard (critical for learning)
+        # Larger radius for food (survival priority)
+        food_dx, food_dy = 0.0, 0.0
+        hazard_dx, hazard_dy = 0.0, 0.0
+        search_radius = 8  # Match heuristic's search radius
+
+        nearby_large = self.world.objects_near(self.pos, radius=search_radius)
+        nearest_food_dist = float('inf')
+        nearest_hazard_dist = float('inf')
+
+        for dist, pos, obj in nearby_large:
+            if dist == 0:
+                continue  # Skip objects at current position
+
+            if isinstance(obj, Food) and dist < nearest_food_dist:
+                nearest_food_dist = dist
+                # Normalized relative offset (-1 to 1)
+                food_dx = (pos[1] - self.pos[1]) / search_radius
+                food_dy = (pos[0] - self.pos[0]) / search_radius
+
+            if isinstance(obj, Hazard) and dist < nearest_hazard_dist:
+                nearest_hazard_dist = dist
+                hazard_dx = (pos[1] - self.pos[1]) / search_radius
+                hazard_dy = (pos[0] - self.pos[0]) / search_radius
+
         return dict(
             energy=self.energy,
             hydration=self.hydration,
@@ -541,6 +570,10 @@ class KosmosAgent:
             goal=self.embodied_goal,
             entropy=self.entropy,
             surplus_mean=self.surplus_mean,
+            food_dx=food_dx,
+            food_dy=food_dy,
+            hazard_dx=hazard_dx,
+            hazard_dy=hazard_dy,
         )
 
     # ------------------------------------------------------------------ #
@@ -734,7 +767,9 @@ class KosmosAgent:
         reward = self._compute_reward(tool_name, result)
 
         # 7b. Apply anti-oscillation penalty (5f)
-        action_penalty = self._get_action_penalty(tool_name)
+        # Use granular action name (move_north vs move) for directional specificity
+        granular_action_for_penalty = decision_to_action_name(decision)
+        action_penalty = self._get_action_penalty(granular_action_for_penalty)
         reward = reward - action_penalty
 
         # 8. Update L1: GoalModuleV2
@@ -844,7 +879,10 @@ class KosmosAgent:
             self.emile.step(dt=0.005, external_input={"reward": qse_reward})
 
         # 13. Track action for anti-oscillation (5f)
-        self._recent_actions.append(tool_name)
+        # Use granular action names (move_north, move_south, etc.) so directional
+        # oscillation is penalized but exploring new directions is not.
+        granular_action = decision_to_action_name(decision)
+        self._recent_actions.append(granular_action)
         if len(self._recent_actions) > self._action_repeat_window:
             self._recent_actions = self._recent_actions[-self._action_repeat_window:]
 
@@ -1041,7 +1079,7 @@ class KosmosAgent:
             dirs = ["north", "south", "east", "west"]
             # Avoid current facing direction to encourage new paths
             other_dirs = [d for d in dirs if d != self.facing]
-            direction = other_dirs[np.random.randint(len(other_dirs))]
+            direction = other_dirs[int(np.random.randint(len(other_dirs)))]
             return {"tool": "move", "args": {"direction": direction},
                     "thought": "Breaking out of stuck area."}
 
@@ -1091,7 +1129,7 @@ class KosmosAgent:
                         return {"tool": "move", "args": {"direction": d},
                                 "thought": "Heading toward food."}
         # Random exploration
-        d = dirs[np.random.randint(len(dirs))]
+        d = dirs[int(np.random.randint(len(dirs)))]
         return {"tool": "move", "args": {"direction": d},
                 "thought": "Wandering..."}
 

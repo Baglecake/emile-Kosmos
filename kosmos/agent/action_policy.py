@@ -29,7 +29,7 @@ EMBODIED_GOALS = [
 BIOMES = ['plains', 'forest', 'desert', 'water', 'rock']
 TIMES_OF_DAY = ['dawn', 'day', 'dusk', 'night']
 
-KOSMOS_INPUT_DIM = 30
+KOSMOS_INPUT_DIM = 34  # Increased from 30 to add directional cues
 KOSMOS_N_ACTIONS = len(KOSMOS_ACTIONS)  # 11
 
 
@@ -52,8 +52,19 @@ def encode_kosmos_state(
     goal: str,
     entropy: float,
     surplus_mean: float,
+    food_dx: float = 0.0,
+    food_dy: float = 0.0,
+    hazard_dx: float = 0.0,
+    hazard_dy: float = 0.0,
 ) -> np.ndarray:
-    """Encode Kosmos agent state into a fixed-size feature vector (30-dim)."""
+    """Encode Kosmos agent state into a fixed-size feature vector (34-dim).
+
+    The directional cues (food_dx/dy, hazard_dx/dy) are normalized relative
+    offsets to the nearest food/hazard, ranging from -1 to 1, where:
+      - Positive dx means target is to the east
+      - Positive dy means target is to the south
+      - (0, 0) means no target found within search radius
+    """
     state = np.zeros(KOSMOS_INPUT_DIM)
 
     # Vitals [0-1]
@@ -96,7 +107,13 @@ def encode_kosmos_state(
     state[27] = float(np.clip(entropy, 0.0, 1.0))
     state[28] = float(np.clip(surplus_mean, -1.0, 1.0))
 
-    # [29] reserved
+    # Directional cues [29-32] - critical for learning to move toward food
+    state[29] = float(np.clip(food_dx, -1.0, 1.0))
+    state[30] = float(np.clip(food_dy, -1.0, 1.0))
+    state[31] = float(np.clip(hazard_dx, -1.0, 1.0))
+    state[32] = float(np.clip(hazard_dy, -1.0, 1.0))
+
+    # [33] reserved
     return state
 
 
@@ -265,6 +282,23 @@ class KosmosActionPolicy:
         self.W2 = data['W2']; self.b2 = data['b2']
         self._baseline = float(data['baseline'][0])
         self._total_updates = int(data['total_updates'][0])
+
+
+def decision_to_action_name(decision: dict) -> str:
+    """Extract a granular action name from a decision dict for anti-oscillation.
+
+    For moves, returns "move_north", "move_south", etc. instead of just "move".
+    This allows anti-oscillation to penalize N↔S oscillation differently from
+    exploring new directions.
+    """
+    tool = decision.get("tool", "wait")
+    args = decision.get("args", {})
+
+    if tool == "move":
+        direction = args.get("direction", "north")
+        return f"move_{direction}"
+
+    return tool
 
 
 def action_to_tool_call(action_name: str, agent) -> dict:
