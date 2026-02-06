@@ -29,7 +29,7 @@ EMBODIED_GOALS = [
 BIOMES = ['plains', 'forest', 'desert', 'water', 'rock']
 TIMES_OF_DAY = ['dawn', 'day', 'dusk', 'night']
 
-KOSMOS_INPUT_DIM = 34  # Increased from 30 to add directional cues
+KOSMOS_INPUT_DIM = 35  # 34 + sigma_ema (curvature/tension)
 KOSMOS_N_ACTIONS = len(KOSMOS_ACTIONS)  # 11
 
 
@@ -56,8 +56,9 @@ def encode_kosmos_state(
     food_dy: float = 0.0,
     hazard_dx: float = 0.0,
     hazard_dy: float = 0.0,
+    sigma_ema: float = 0.0,
 ) -> np.ndarray:
-    """Encode Kosmos agent state into a fixed-size feature vector (34-dim).
+    """Encode Kosmos agent state into a fixed-size feature vector (35-dim).
 
     The directional cues (food_dx/dy, hazard_dx/dy) are normalized relative
     offsets to the nearest food/hazard, ranging from -1 to 1, where:
@@ -119,6 +120,10 @@ def encode_kosmos_state(
     if has_food_here and energy < 0.5:
         should_eat_urgency = (0.5 - energy) * 2.0  # 0 at 0.5 energy, 1.0 at 0 energy
     state[33] = should_eat_urgency
+
+    # Curvature/tension signal [34] - indicates structured failure pattern
+    # High sigma_ema = agent is in a "death trap" situation
+    state[34] = float(np.clip(sigma_ema, 0.0, 1.0))
 
     return state
 

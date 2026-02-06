@@ -610,6 +610,7 @@ class KosmosAgent:
             food_dy=food_dy,
             hazard_dx=hazard_dx,
             hazard_dy=hazard_dy,
+            sigma_ema=self._st_metrics.get("sigma_ema", 0.0),
         )
 
     # ------------------------------------------------------------------ #
