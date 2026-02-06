@@ -357,9 +357,10 @@ class SurplusTensionModule:
             if self._current_tick - t < death_window
         )
 
-        # Each recent death drops k by 0.5
-        # 0 deaths: k=2.0, 1 death: k=1.5, 2 deaths: k=1.0, 3+ deaths: k=0.5
-        death_penalty = 0.5 * recent_deaths
+        # Each recent death drops k by 0.75 (more aggressive than 0.5)
+        # 0 deaths: k=2.0, 1 death: k=1.25, 2 deaths: k=0.5
+        # This triggers ruptures earlier in persistent death traps
+        death_penalty = 0.75 * recent_deaths
         k_effective = max(k_min, k_base - death_penalty)
         self._last_k_effective = k_effective  # Track for monitoring
 
