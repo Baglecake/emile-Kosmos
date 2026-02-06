@@ -17,7 +17,7 @@ from ..world.objects import (
 from ..world.weather import WeatherType
 from ..tools.registry import ToolRegistry
 from ..tools.builtins import get_builtin_tools
-from ..llm.ollama import OllamaReasoner
+from ..llm.ollama import OllamaReasoner, AgentState
 from .action_policy import (
     KosmosActionPolicy,
     action_to_tool_call,
@@ -827,6 +827,19 @@ class KosmosAgent:
             situation_with_trigger = situation
             if fire_reason and fire_reason != "periodic refresh":
                 situation_with_trigger = f"[Event: {fire_reason}]\n\n{situation}"
+            # Build embodied agent state for LLM (Phase 7)
+            nearby = self.world.objects_near(self.pos, radius=3)
+            hazard_nearby = any(isinstance(o, Hazard) for _, _, o in nearby)
+            food_nearby = any(isinstance(o, Food) for _, _, o in nearby)
+            agent_state = AgentState(
+                energy=self.energy,
+                hydration=self.hydration,
+                sigma_ema=self._st_metrics.get("sigma_ema", 0.0),
+                hazard_nearby=hazard_nearby,
+                food_nearby=food_nearby,
+                in_crisis=(self._consciousness_zone == "crisis"),
+            )
+
             llm_args = dict(
                 situation=situation_with_trigger,
                 tools=schemas,
@@ -836,6 +849,7 @@ class KosmosAgent:
                 inventory=[f"{o.name} ({o.craft_tag})" for o in self.inventory],
                 memory_hits=self._recent_relevant_memories(),
                 last_result=last_res,
+                agent_state=agent_state,
             )
             use_planning = self._use_planning
 

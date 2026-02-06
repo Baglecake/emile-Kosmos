@@ -1,12 +1,46 @@
-"""LLM reasoning via Ollama with QSE-modulated parameters."""
+"""LLM reasoning via Ollama with QSE-modulated parameters.
+
+Phase 7: Embodied LLM integration
+- Agent physiological state modulates LLM reasoning
+- Logit bias nudges token probabilities based on survival needs
+- "Visceral" prompts make the LLM feel danger/hunger
+"""
 
 import json
 import threading
 from collections import deque
+from dataclasses import dataclass
 import requests
 from typing import Optional
 
 OLLAMA_URL = "http://localhost:11434"
+
+
+@dataclass
+class AgentState:
+    """Physiological state passed to LLM for embodied reasoning.
+
+    This allows the LLM to "feel" the agent's condition rather than
+    just reading about it in the prompt.
+    """
+    energy: float = 0.5
+    hydration: float = 0.5
+    sigma_ema: float = 0.0      # Curvature/tension (death trap indicator)
+    hazard_nearby: bool = False
+    food_nearby: bool = False
+    in_crisis: bool = False
+
+    @property
+    def stress_level(self) -> float:
+        """Compute overall stress (0-1) from physiological signals."""
+        # Low energy/hydration = stress
+        vital_stress = max(0, 1.0 - min(self.energy, self.hydration) * 2)
+        # High curvature = stress (death trap)
+        trap_stress = self.sigma_ema
+        # Hazard = stress
+        hazard_stress = 0.5 if self.hazard_nearby else 0.0
+        # Combine with weights
+        return min(1.0, 0.4 * vital_stress + 0.3 * trap_stress + 0.3 * hazard_stress)
 
 
 class ConversationHistory:
@@ -45,6 +79,7 @@ class OllamaReasoner:
 
     QSE entropy -> temperature (creativity).
     QSE strategy -> personality/focus.
+    Agent state -> embodied cognition (logit bias, visceral prompts).
     """
 
     def __init__(self, model: str = "llama3.1:8b"):
@@ -52,6 +87,116 @@ class OllamaReasoner:
         self._lock = threading.Lock()
         self._available = None
         self.history = ConversationHistory(max_turns=4)
+
+        # Embodied LLM settings
+        self.enable_embodied = True  # Toggle for A/B testing
+        self.logit_bias_strength = 5.0  # How strongly to bias tokens
+
+        # Token IDs for key concepts (model-specific, llama3 approximate)
+        # These would ideally be computed from the tokenizer
+        # For now, using common token patterns - will refine with testing
+        self._survival_tokens = {
+            # Positive bias when hungry/in danger
+            "food": 3105,
+            "eat": 8234,
+            "consume": 29561,
+            "flee": 29813,
+            "escape": 12169,
+            "danger": 9703,
+            "move": 3351,
+            "urgent": 26551,
+            # Negative bias when stressed (avoid complacency)
+            "wait": 3524,
+            "rest": 2800,
+            "examine": 21635,
+        }
+
+    def _compute_embodied_context(self, state: AgentState) -> str:
+        """
+        Generate visceral context from agent state.
+
+        Instead of just saying "energy is 30%", we describe how it FEELS.
+        This primes the LLM to respond with urgency/caution appropriately.
+        """
+        if not self.enable_embodied:
+            return ""
+
+        parts = []
+
+        # Energy-based feelings
+        if state.energy < 0.15:
+            parts.append("You feel DESPERATELY weak. Your vision blurs. Every moment without food could be your last.")
+        elif state.energy < 0.30:
+            parts.append("Hunger gnaws at you painfully. You MUST find food soon.")
+        elif state.energy < 0.45:
+            parts.append("Your stomach rumbles. You're getting hungry.")
+
+        # Hydration-based feelings
+        if state.hydration < 0.20:
+            parts.append("Your throat burns with thirst. Water is critical.")
+        elif state.hydration < 0.35:
+            parts.append("You feel parched. Finding water would be wise.")
+
+        # Danger/tension feelings
+        if state.hazard_nearby:
+            parts.append("DANGER! You sense something threatening nearby. Your instincts scream to move away.")
+
+        if state.sigma_ema > 0.6:
+            parts.append("Something is deeply wrong. You've been struggling here for too long. You need to try something DIFFERENT.")
+        elif state.sigma_ema > 0.4:
+            parts.append("A growing unease tells you this area isn't working out.")
+
+        # Crisis override
+        if state.in_crisis:
+            parts.append("THIS IS A SURVIVAL EMERGENCY. Every action must serve immediate survival.")
+
+        if not parts:
+            return ""
+
+        return "\n[INTERNAL FEELINGS]\n" + " ".join(parts) + "\n"
+
+    def _compute_logit_bias(self, state: AgentState) -> dict:
+        """
+        Compute token probability biases based on agent state.
+
+        Returns dict mapping token_id -> bias value.
+        Positive bias = more likely, Negative bias = less likely.
+        Range: -100 to 100 (Ollama uses additive logit bias).
+        """
+        if not self.enable_embodied:
+            return {}
+
+        bias = {}
+        strength = self.logit_bias_strength
+
+        # When hungry, bias toward food-related actions
+        if state.energy < 0.35:
+            hunger_factor = (0.35 - state.energy) / 0.35  # 0 to 1
+            bias[self._survival_tokens["food"]] = int(strength * hunger_factor * 2)
+            bias[self._survival_tokens["eat"]] = int(strength * hunger_factor * 2)
+            bias[self._survival_tokens["consume"]] = int(strength * hunger_factor * 2)
+            # Discourage waiting when hungry
+            bias[self._survival_tokens["wait"]] = int(-strength * hunger_factor)
+            bias[self._survival_tokens["rest"]] = int(-strength * hunger_factor * 0.5)
+
+        # When in danger, bias toward escape
+        if state.hazard_nearby:
+            bias[self._survival_tokens["flee"]] = int(strength * 2)
+            bias[self._survival_tokens["escape"]] = int(strength * 2)
+            bias[self._survival_tokens["move"]] = int(strength * 1.5)
+            bias[self._survival_tokens["danger"]] = int(strength)
+
+        # When stuck in death trap, bias toward novelty
+        if state.sigma_ema > 0.5:
+            trap_factor = min(1.0, (state.sigma_ema - 0.5) * 2)
+            bias[self._survival_tokens["move"]] = bias.get(self._survival_tokens["move"], 0) + int(strength * trap_factor)
+            bias[self._survival_tokens["escape"]] = bias.get(self._survival_tokens["escape"], 0) + int(strength * trap_factor)
+            # Strongly discourage staying put
+            bias[self._survival_tokens["wait"]] = bias.get(self._survival_tokens["wait"], 0) - int(strength * trap_factor * 2)
+            bias[self._survival_tokens["examine"]] = bias.get(self._survival_tokens["examine"], 0) - int(strength * trap_factor)
+
+        # Filter out zero biases
+        return {k: v for k, v in bias.items() if v != 0}
 
     def check_available(self) -> bool:
         """Check if Ollama is running and model is available."""
@@ -83,9 +228,14 @@ class OllamaReasoner:
         inventory: list[str],
         memory_hits: list[str] | None = None,
         last_result: str = "",
+        agent_state: AgentState | None = None,
     ) -> dict:
         """
         Ask the LLM to decide what to do.
+
+        Args:
+            agent_state: Optional physiological state for embodied reasoning.
+                         If provided, enables visceral prompts and logit biasing.
 
         Returns: {"tool": "tool_name", "args": {...}, "thought": "inner monologue"}
         """
@@ -110,10 +260,16 @@ class OllamaReasoner:
         if memory_hits:
             mem_str = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memory_hits[:3])
 
+        # Embodied cognition: inject visceral feelings based on agent state
+        embodied_context = ""
+        if agent_state:
+            embodied_context = self._compute_embodied_context(agent_state)
+
         system = (
             f"{personality}\n\n"
             f"You are a small creature trying to survive in a wild world. "
-            f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}\n\n"
+            f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}"
+            f"{embodied_context}\n\n"
             f"Available tools:\n{tool_list}\n\n"
             f"Respond ONLY with valid JSON in this exact format:\n"
             f'{{"tool": "tool_name", "args": {{"param": "value"}}, '
@@ -134,13 +290,25 @@ class OllamaReasoner:
         messages.extend(history)
         messages.append({"role": "user", "content": user_content})
 
+        # Compute logit bias from agent state
+        logit_bias = {}
+        if agent_state:
+            logit_bias = self._compute_logit_bias(agent_state)
+
+        # Build options dict
+        options = {"temperature": float(temperature)}
+        if logit_bias:
+            # Note: Ollama uses "logit_bias" in options for some models
+            # This may need adjustment based on model support
+            options["logit_bias"] = logit_bias
+
         try:
             resp = requests.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
                     "model": self.model,
                     "messages": messages,
-                    "options": {"temperature": float(temperature)},
+                    "options": options,
                     "stream": False,
                     "format": "json",
                 },
@@ -217,9 +385,13 @@ class OllamaReasoner:
         inventory: list[str],
         memory_hits: list[str] | None = None,
         last_result: str = "",
+        agent_state: AgentState | None = None,
     ) -> dict:
         """
         Ask the LLM to produce a multi-step plan (3-5 actions).
+
+        Args:
+            agent_state: Optional physiological state for embodied reasoning.
 
         Returns: {
             "plan": [{"tool": "...", "args": {...}, "thought": "..."}],
@@ -248,10 +420,16 @@ class OllamaReasoner:
         if memory_hits:
             mem_str = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memory_hits[:3])
 
+        # Embodied cognition: inject visceral feelings
+        embodied_context = ""
+        if agent_state:
+            embodied_context = self._compute_embodied_context(agent_state)
+
         system = (
             f"{personality}\n\n"
             f"You are a small creature trying to survive in a wild world. "
-            f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}\n\n"
+            f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}"
+            f"{embodied_context}\n\n"
             f"Available tools:\n{tool_list}\n\n"
             f"Create a SHORT PLAN (2-4 steps) to achieve a goal. "
             f"Respond ONLY with valid JSON in this exact format:\n"
@@ -270,13 +448,22 @@ class OllamaReasoner:
         messages = [{"role": "system", "content": system}]
         messages.append({"role": "user", "content": user_content})
 
+        # Compute logit bias from agent state
+        logit_bias = {}
+        if agent_state:
+            logit_bias = self._compute_logit_bias(agent_state)
+
+        options = {"temperature": float(temperature)}
+        if logit_bias:
+            options["logit_bias"] = logit_bias
+
         try:
             resp = requests.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
                     "model": self.model,
                     "messages": messages,
-                    "options": {"temperature": float(temperature)},
+                    "options": options,
                     "stream": False,
                     "format": "json",
                 },
