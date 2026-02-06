@@ -260,6 +260,17 @@ class OllamaReasoner:
         if memory_hits:
             mem_str = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memory_hits[:3])
 
+        # Craft recipes info (LLM is the strategic decision-maker for crafting)
+        craft_info = (
+            "\n\nCRAFTING: You can combine items from inventory to make tools:\n"
+            "- wood + stone = axe (reduces forest movement cost)\n"
+            "- wood + fiber = rope (cross water easier)\n"
+            "- fiber + shell = basket (increases inventory capacity to 10)\n"
+            "- stone + stone = flint (cooking improves food energy by 30%)\n"
+            "- wood + wood = shelter_frame (reduces night energy penalty)\n"
+            "Use 'craft' tool with item1 and item2 when you have matching materials."
+        )
+
         # Embodied cognition: inject visceral feelings based on agent state
         embodied_context = ""
         if agent_state:
@@ -269,6 +280,7 @@ class OllamaReasoner:
             f"{personality}\n\n"
             f"You are a small creature trying to survive in a wild world. "
             f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}"
+            f"{craft_info if inventory else ''}"
             f"{embodied_context}\n\n"
             f"Available tools:\n{tool_list}\n\n"
             f"Respond ONLY with valid JSON in this exact format:\n"
@@ -420,6 +432,17 @@ class OllamaReasoner:
         if memory_hits:
             mem_str = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memory_hits[:3])
 
+        # Craft recipes info (LLM is the strategic decision-maker for crafting)
+        craft_info = (
+            "\n\nCRAFTING: You can combine items from inventory to make tools:\n"
+            "- wood + stone = axe (reduces forest movement cost)\n"
+            "- wood + fiber = rope (cross water easier)\n"
+            "- fiber + shell = basket (increases inventory capacity to 10)\n"
+            "- stone + stone = flint (cooking improves food energy by 30%)\n"
+            "- wood + wood = shelter_frame (reduces night energy penalty)\n"
+            "Use 'craft' tool with item1 and item2 when you have matching materials."
+        )
+
         # Embodied cognition: inject visceral feelings
         embodied_context = ""
         if agent_state:
@@ -429,6 +452,7 @@ class OllamaReasoner:
             f"{personality}\n\n"
             f"You are a small creature trying to survive in a wild world. "
             f"Your energy is {energy:.0%}. Your inventory: [{inv_str}].{mem_str}"
+            f"{craft_info if inventory else ''}"
             f"{embodied_context}\n\n"
             f"Available tools:\n{tool_list}\n\n"
             f"Create a SHORT PLAN (2-4 steps) to achieve a goal. "

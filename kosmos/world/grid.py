@@ -137,12 +137,12 @@ class KosmosWorld:
                 self.resource_nodes[pos] = node
                 self._add_object(Water(position=pos), pos)
 
-        # Hazard nodes: ~3% coverage, in harsh biomes
-        # Hazards are PERMANENT - don't respawn (no node tracking)
-        for _ in range(int(n * 0.03)):
-            pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
-            if pos not in self.resource_nodes:
-                self._add_object(Hazard(position=pos), pos)
+        # Hazards disabled - they trapped agent without meaningful learning
+        # Can be re-enabled with a clear_hazard tool in the future
+        # for _ in range(int(n * 0.03)):
+        #     pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
+        #     if pos not in self.resource_nodes:
+        #         self._add_object(Hazard(position=pos), pos)
 
         # Craft item nodes: ~2% coverage
         # Slow respawn (resources are limited)

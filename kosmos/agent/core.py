@@ -1208,34 +1208,11 @@ class KosmosAgent:
         return float(np.clip(r, -1.0, 1.0))
 
     def _heuristic_decide(self) -> dict:
-        """Fallback decision-making when LLM is unavailable."""
-        # PRIORITY 1: Hazard avoidance — flee if hazard within 2 cells
-        nearby = self.world.objects_near(self.pos, radius=2)
-        for dist, haz_pos, obj in nearby:
-            if isinstance(obj, Hazard) and dist > 0:
-                # Move away from hazard
-                dr = self.pos[0] - haz_pos[0]
-                dc = self.pos[1] - haz_pos[1]
-                if abs(dr) >= abs(dc):
-                    flee_dir = "south" if dr > 0 else "north"
-                else:
-                    flee_dir = "east" if dc > 0 else "west"
-                # Validate the flee direction is in bounds
-                nr = self.pos[0] + DIRECTIONS[flee_dir][0]
-                nc = self.pos[1] + DIRECTIONS[flee_dir][1]
-                if 0 <= nr < self.world.size and 0 <= nc < self.world.size:
-                    return {"tool": "move", "args": {"direction": flee_dir},
-                            "thought": "Danger! Fleeing from hazard."}
-                # If can't flee that way, try perpendicular
-                perp_dirs = ["east", "west"] if abs(dr) >= abs(dc) else ["north", "south"]
-                for d in perp_dirs:
-                    nr = self.pos[0] + DIRECTIONS[d][0]
-                    nc = self.pos[1] + DIRECTIONS[d][1]
-                    if 0 <= nr < self.world.size and 0 <= nc < self.world.size:
-                        return {"tool": "move", "args": {"direction": d},
-                                "thought": "Evading hazard."}
+        """Fallback decision-making when LLM is unavailable.
 
-        # PRIORITY 2: Emergency food/water if low energy/hydration
+        Note: Hazards are disabled. Crafting is LLM-only (strategic decision).
+        """
+        # PRIORITY 1: Emergency food/water if low energy/hydration
         if self.energy < 0.45:  # was 0.35 — seek food earlier
             for obj in self.world.objects_at(self.pos):
                 if isinstance(obj, Food):
@@ -1263,8 +1240,8 @@ class KosmosAgent:
                         return {"tool": "move", "args": {"direction": direction},
                                 "thought": f"Returning to last known food at {self._last_known_food_pos}."}
 
-        # PRIORITY 3: Emergency water if low hydration
-        if self.hydration < 0.4:  # was 0.3 — seek water earlier
+        # PRIORITY 2: Emergency water if low hydration
+        if self.hydration < 0.6:  # seek water proactively (GPT recommendation)
             for obj in self.world.objects_at(self.pos):
                 if isinstance(obj, Water):
                     return {"tool": "consume", "args": {"item": obj.name},
@@ -1299,15 +1276,7 @@ class KosmosAgent:
             return {"tool": "move", "args": {"direction": direction},
                     "thought": "Breaking out of stuck area."}
 
-        # Try crafting if we have 2+ items
-        if len(self.inventory) >= 2:
-            for i, a in enumerate(self.inventory):
-                for b in self.inventory[i + 1:]:
-                    key = tuple(sorted([a.craft_tag, b.craft_tag]))
-                    if key in CRAFT_RECIPES and CRAFT_RECIPES[key][0] not in self.crafted:
-                        return {"tool": "craft",
-                                "args": {"item1": a.name, "item2": b.name},
-                                "thought": "Can craft something!"}
+        # Crafting is now LLM-only (strategic decision, not reflex)
 
         # Storm: seek shelter (forest)
         w = self.world.weather.current
