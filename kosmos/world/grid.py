@@ -1,6 +1,7 @@
 """KosmosWorld: the living grid with biomes, objects, and survival pressure."""
 
 import numpy as np
+from dataclasses import dataclass
 from typing import Optional
 from .objects import (
     Biome, BIOME_MOVE_COST, Food, Water, Hazard, CraftItem, WorldObject,
@@ -9,6 +10,19 @@ from .objects import (
 from .weather import WeatherManager, WeatherType
 
 _OPPOSITES = {"north": "south", "south": "north", "east": "west", "west": "east"}
+
+
+@dataclass
+class ResourceNode:
+    """Fixed location where a resource spawns/respawns.
+
+    Resources exist at fixed nodes, not randomly everywhere.
+    When consumed, the node is depleted and respawns after cooldown.
+    """
+    position: tuple
+    resource_type: str  # 'food', 'water', 'craft', 'hazard', 'herb', 'seed'
+    cooldown: int = 0           # ticks until respawn (0 = has resource)
+    respawn_time: int = 150     # ticks to respawn after depletion
 
 
 def _opposite_dir(d: str) -> str:
@@ -33,7 +47,11 @@ class KosmosWorld:
         # Objects on the grid: position -> list[WorldObject]
         self.objects: dict[tuple, list[WorldObject]] = {}
 
-        # Spawn initial objects
+        # Resource nodes: fixed spawn points that respawn when depleted
+        # position -> ResourceNode
+        self.resource_nodes: dict[tuple, ResourceNode] = {}
+
+        # Spawn initial objects at fixed node locations
         self._spawn_initial_objects()
 
         # World clock
@@ -91,41 +109,65 @@ class KosmosWorld:
         return grid
 
     # ------------------------------------------------------------------ #
-    #  Object spawning                                                     #
+    #  Object spawning (fixed resource nodes)                              #
     # ------------------------------------------------------------------ #
     def _spawn_initial_objects(self):
-        """Populate world with initial resources."""
+        """Create fixed resource nodes and spawn initial objects.
+
+        Resources spawn at fixed locations. When consumed, they respawn
+        at the SAME location after a cooldown - no random new locations.
+        """
         n = self.size * self.size
 
-        # Food: ~8% coverage, biased toward plains/forest
-        for _ in range(int(n * 0.08)):
+        # Food nodes: ~6% coverage, biased toward plains/forest
+        # Respawn time varies by food type
+        for _ in range(int(n * 0.06)):
             pos = self._random_pos(prefer=[Biome.PLAINS, Biome.FOREST])
-            self._add_object(Food(position=pos), pos)
+            if pos not in self.resource_nodes:
+                node = ResourceNode(pos, 'food', cooldown=0, respawn_time=120)
+                self.resource_nodes[pos] = node
+                self._add_object(Food(position=pos), pos)
 
-        # Water: ~3% coverage, biased toward water/forest biomes
-        for _ in range(int(n * 0.03)):
-            pos = self._random_pos(prefer=[Biome.WATER, Biome.FOREST])
-            self._add_object(Water(position=pos), pos)
-
-        # Hazards: ~4% coverage, biased toward desert/rock
-        for _ in range(int(n * 0.04)):
-            pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
-            self._add_object(Hazard(position=pos), pos)
-
-        # Craft items: ~3%
-        for _ in range(int(n * 0.03)):
-            pos = self._random_pos()
-            self._add_object(CraftItem(position=pos), pos)
-
-        # Herbs: ~2%, biased toward forest
+        # Water nodes: ~2% coverage, near water biomes
+        # Water respawns quickly
         for _ in range(int(n * 0.02)):
-            pos = self._random_pos(prefer=[Biome.FOREST])
-            self._add_object(Herb(position=pos), pos)
+            pos = self._random_pos(prefer=[Biome.WATER, Biome.FOREST])
+            if pos not in self.resource_nodes:
+                node = ResourceNode(pos, 'water', cooldown=0, respawn_time=80)
+                self.resource_nodes[pos] = node
+                self._add_object(Water(position=pos), pos)
 
-        # Seeds: ~1%, biased toward plains/forest
+        # Hazard nodes: ~3% coverage, in harsh biomes
+        # Hazards are PERMANENT - don't respawn (no node tracking)
+        for _ in range(int(n * 0.03)):
+            pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
+            if pos not in self.resource_nodes:
+                self._add_object(Hazard(position=pos), pos)
+
+        # Craft item nodes: ~2% coverage
+        # Slow respawn (resources are limited)
+        for _ in range(int(n * 0.02)):
+            pos = self._random_pos()
+            if pos not in self.resource_nodes:
+                node = ResourceNode(pos, 'craft', cooldown=0, respawn_time=300)
+                self.resource_nodes[pos] = node
+                self._add_object(CraftItem(position=pos), pos)
+
+        # Herb nodes: ~1%, forest only
         for _ in range(int(n * 0.01)):
+            pos = self._random_pos(prefer=[Biome.FOREST])
+            if pos not in self.resource_nodes:
+                node = ResourceNode(pos, 'herb', cooldown=0, respawn_time=200)
+                self.resource_nodes[pos] = node
+                self._add_object(Herb(position=pos), pos)
+
+        # Seed nodes: ~0.5%, rare
+        for _ in range(int(n * 0.005)):
             pos = self._random_pos(prefer=[Biome.PLAINS, Biome.FOREST])
-            self._add_object(Seed(position=pos), pos)
+            if pos not in self.resource_nodes:
+                node = ResourceNode(pos, 'seed', cooldown=0, respawn_time=400)
+                self.resource_nodes[pos] = node
+                self._add_object(Seed(position=pos), pos)
 
     def _random_pos(self, prefer: list[Biome] | None = None) -> tuple:
         """Pick a random position, optionally biased toward certain biomes."""
@@ -146,49 +188,40 @@ class KosmosWorld:
     #  World tick                                                          #
     # ------------------------------------------------------------------ #
     def tick(self):
-        """Advance world by one step. Objects decay, new ones may spawn."""
+        """Advance world by one step. Depleted nodes respawn, objects decay."""
         self.tick_count += 1
         self.events.clear()
 
         # Weather update
         self.weather.tick()
 
-        # Seasonal modulation of spawn rates
+        # Seasonal modifiers affect respawn speed
         _season_mods = {
-            "spring": (1.0, 1.0, 1.0),    # (food_target, food_prob, hazard_prob)
-            "summer": (0.85, 0.85, 1.8),
-            "autumn": (1.4, 1.3, 0.7),
-            "winter": (0.5, 0.5, 1.5),
+            "spring": 1.0,   # normal respawn
+            "summer": 0.8,   # faster respawn (growth season)
+            "autumn": 1.2,   # slower respawn
+            "winter": 2.0,   # much slower respawn
         }
-        ft_mod, fp_mod, hp_mod = _season_mods.get(self.season, (1.0, 1.0, 1.0))
+        season_mod = _season_mods.get(self.season, 1.0)
 
-        # Weather modifiers on spawning
+        # Rain speeds up water respawn
         w = self.weather.current
-        water_spawn_mod = 1.0
-        if w and w.weather_type == WeatherType.RAIN:
-            water_spawn_mod = 2.0 * w.intensity
-        if w and w.weather_type == WeatherType.STORM:
-            hp_mod *= 1.0 + 0.5 * w.intensity
+        water_mod = 0.5 if (w and w.weather_type == WeatherType.RAIN) else 1.0
 
-        # Decay existing objects
-        to_remove = []
-        for pos, objs in self.objects.items():
-            surviving = []
-            for obj in objs:
-                if obj.tick():
-                    surviving.append(obj)
-                else:
-                    self.events.append({
-                        "type": "decay", "object": obj.name, "position": pos
-                    })
-            if surviving:
-                self.objects[pos] = surviving
-            else:
-                to_remove.append(pos)
-        for pos in to_remove:
-            del self.objects[pos]
+        # Tick depleted resource nodes - respawn when cooldown expires
+        for pos, node in self.resource_nodes.items():
+            if node.cooldown > 0:
+                # Apply season modifier to respawn
+                effective_mod = season_mod
+                if node.resource_type == 'water':
+                    effective_mod *= water_mod
 
-        # Mature crops become food
+                node.cooldown -= 1
+                if node.cooldown <= 0:
+                    # Respawn the resource at this node
+                    self._respawn_at_node(node)
+
+        # Mature crops become food (player-planted, not node-based)
         for pos in list(self.objects.keys()):
             objs = self.objects.get(pos, [])
             for obj in list(objs):
@@ -199,41 +232,30 @@ class KosmosWorld:
                         "type": "harvest", "object": "crop", "position": pos
                     })
 
-        # Spawn new food (migration — never in same spot)
-        food_count = sum(
-            1 for objs in self.objects.values()
-            for obj in objs if isinstance(obj, Food)
-        )
-        target_food = int(self.size * self.size * 0.06 * ft_mod)
-        if food_count < target_food and self.rng.random() < 0.15 * fp_mod:
-            pos = self._random_pos(prefer=[Biome.PLAINS, Biome.FOREST])
-            if pos not in self.objects or not any(
-                isinstance(o, Food) for o in self.objects.get(pos, [])
-            ):
-                self._add_object(Food(position=pos), pos)
-                self.events.append({
-                    "type": "spawn", "object": "food", "position": pos
-                })
-
-        # Occasional water spawns (boosted by rain)
-        if self.rng.random() < 0.02 * water_spawn_mod:
-            pos = self._random_pos(prefer=[Biome.WATER, Biome.FOREST])
+    def _respawn_at_node(self, node: ResourceNode):
+        """Respawn a resource at a depleted node."""
+        pos = node.position
+        if node.resource_type == 'food':
+            self._add_object(Food(position=pos), pos)
+        elif node.resource_type == 'water':
             self._add_object(Water(position=pos), pos)
-
-        # Occasional hazard spawns
-        if self.rng.random() < 0.02 * hp_mod:
-            pos = self._random_pos(prefer=[Biome.DESERT, Biome.ROCK])
-            self._add_object(Hazard(position=pos), pos)
-
-        # Occasional craft item spawns
-        if self.rng.random() < 0.03:
-            pos = self._random_pos()
+        elif node.resource_type == 'craft':
             self._add_object(CraftItem(position=pos), pos)
-
-        # Occasional herb spawns
-        if self.rng.random() < 0.01:
-            pos = self._random_pos(prefer=[Biome.FOREST])
+        elif node.resource_type == 'herb':
             self._add_object(Herb(position=pos), pos)
+        elif node.resource_type == 'seed':
+            self._add_object(Seed(position=pos), pos)
+
+        self.events.append({
+            "type": "respawn", "object": node.resource_type, "position": pos
+        })
+
+    def deplete_node(self, pos: tuple, resource_type: str):
+        """Mark a resource node as depleted (called when resource consumed)."""
+        if pos in self.resource_nodes:
+            node = self.resource_nodes[pos]
+            if node.resource_type == resource_type:
+                node.cooldown = node.respawn_time
 
     # ------------------------------------------------------------------ #
     #  Queries                                                             #

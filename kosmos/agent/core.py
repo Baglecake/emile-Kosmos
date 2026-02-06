@@ -323,6 +323,8 @@ class KosmosAgent:
                 if not self.world.objects[self.pos]:
                     del self.world.objects[self.pos]
                 self.inventory.append(obj)
+                # Mark resource node as depleted for respawn
+                self.world.deplete_node(self.pos, 'craft')
                 self._remember(f"Picked up {obj.name} at {self.pos}.")
                 return f"Picked up {obj.name} ({obj.craft_tag})."
         return f"No '{item}' to pick up here."
@@ -339,6 +341,9 @@ class KosmosAgent:
                     energy_gain *= 1.3
                 self.energy = min(1.0, self.energy + energy_gain)
                 self.food_eaten += 1
+                # Mark resource node as depleted for respawn
+                node_type = 'herb' if isinstance(obj, Herb) else 'food'
+                self.world.deplete_node(self.pos, node_type)
                 # Clear food memory - we ate the food at this location
                 if self._last_known_food_pos == self.pos:
                     self._last_known_food_pos = None
@@ -353,6 +358,8 @@ class KosmosAgent:
                     del self.world.objects[self.pos]
                 self.hydration = min(1.0, self.hydration + obj.hydration_value)
                 self.water_drunk += 1
+                # Mark resource node as depleted for respawn
+                self.world.deplete_node(self.pos, 'water')
                 return f"Drank {obj.name}. Hydration +{obj.hydration_value:.0%}."
         # If no specific item named, consume first available food/water
         if not item:
@@ -1326,10 +1333,22 @@ class KosmosAgent:
         if self.energy < 0.2 and self.strategy == "rest":
             return {"tool": "rest", "args": {}, "thought": "Must rest."}
 
-        # Default: move in a semi-random direction biased by strategy
+        # Default: proactive food-seeking to prevent "wander then panic" pattern
         dirs = list(DIRECTIONS.keys())
+
+        # PROACTIVE: Even at healthy energy (< 0.75), move toward nearby food
+        # This ensures agent doesn't wander aimlessly past food sources
+        if self.energy < 0.75:
+            nearby = self.world.objects_near(self.pos, radius=6)
+            for _, pos, obj in nearby:
+                if isinstance(obj, Food):
+                    d = self._direction_toward(pos)
+                    if d:
+                        return {"tool": "move", "args": {"direction": d},
+                                "thought": "Heading toward food opportunistically."}
+
         if self.strategy == "exploit":
-            # Move toward nearest food
+            # Move toward nearest food (strategy-specific, even when full)
             nearby = self.world.objects_near(self.pos, radius=6)
             for _, pos, obj in nearby:
                 if isinstance(obj, Food):
@@ -1337,7 +1356,8 @@ class KosmosAgent:
                     if d:
                         return {"tool": "move", "args": {"direction": d},
                                 "thought": "Heading toward food."}
-        # Random exploration
+
+        # Random exploration only when full energy or no food visible
         d = dirs[int(np.random.randint(len(dirs)))]
         return {"tool": "move", "args": {"direction": d},
                 "thought": "Wandering..."}

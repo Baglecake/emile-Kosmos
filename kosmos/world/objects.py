@@ -92,7 +92,7 @@ class Hazard(WorldObject):
     color: tuple = (200, 40, 40)
     damage: float = 0.15
     solid: bool = False
-    decay_rate: float = 0.0
+    decay_rate: float = 0.0     # permanent - doesn't decay
 
     def __post_init__(self):
         variants = [
@@ -112,7 +112,7 @@ class CraftItem(WorldObject):
     symbol: str = "+"
     color: tuple = (140, 110, 60)
     craft_tag: str = "wood"
-    decay_rate: float = 0.0
+    decay_rate: float = 0.0     # doesn't decay until picked up
 
     def __post_init__(self):
         variants = [

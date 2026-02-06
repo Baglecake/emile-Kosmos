@@ -147,4 +147,66 @@ Optional refinements
 
 If you find that the crisis zone still suppresses LLM intervention during death traps, consider allowing rupture to bypass the crisis check so the LLM can replan even when energy is low. For now, the stuckness break‐out (random exploration) serves a similar purpose, so this change is optional.
 
-These modifications will make the rupture mechanism truly adaptive and responsive to survival failures. Please implement the death‑sensitive k as described above, reset the dwell timer on rupture, and test again.
+These modifications will make the rupture mechanism truly adaptive and responsive to survival failures. Please implement the death‑sensitive k as described above, reset the dwell timer on rupture, and test again.Here is my synthesis after reviewing the latest simulation output and the key code files (terminal_output.md, surplus_tension.py, core.py, action_policy.py, demo_buffer.py, ollama.py, registry.py, and grid.py):
+
+What’s working
+
+Dynamic rupture threshold: The adaptive threshold now computes a baseline from the recent curvature history and then subtracts 0.5 from the k coefficient for each recent death (minimum k=0.5). This means the rupture threshold drops when deaths cluster. The threshold floor of 0.3 prevents spurious ruptures when the agent is doing well.
+
+Rupture handling: When the threshold is exceeded, core.py resets the current plan, marks the agent as stuck for ten ticks, clears any pending strategy changes and forces an immediate LLM call. This ensures the agent can pivot to a new strategy without being locked by the dwell timer.
+
+Strategy dwell time: The agent now enforces a 10‑tick dwell before changing strategies. This has reduced oscillation between strategies and allows the τ′‑scaled scheduling of LLM calls to take effect.
+
+Surplus‑tension metrics: The SurplusTensionModule computes surplus (|Ψ−Φ|), curvature (σ), an adaptive rupture threshold and an emergent time τ′. High curvature shortens τ′, causing more frequent LLM calls; low curvature lengthens τ′, saving calls.
+
+Demonstration buffer: The DemoBuffer is in place to collect teacher actions for offline behaviour cloning. Together with a competence‑based teacher decay, this lets the small MLP policy gradually learn from the LLM’s decisions.
+
+Observations from the log
+
+Death‑sensitive adaptation is active: In the run shown in terminal_output.md, the k parameter fluctuates between 0.5, 1.0 and 1.5 depending on recent deaths, and the dynamic threshold tracks just above σ. Ruptures occur when σ crosses this threshold, and the [RUPTURE …] log entries confirm that the system now breaks out of recurring death loops.
+
+Deaths are still clustered: The agent continues to die in similar regions (e.g. positions (15, 15), (10, 13)) despite frequent ruptures. Each rupture resets the internal model, but the underlying policy still lacks robust survival strategies.
+
+Teacher probability is very low: In this run, teacher_prob remains at its floor (0.15). This means the learned policy is making most decisions despite its modest accuracy (2–3 % at behaviour‑cloning updates). The demonstration buffer will need to accumulate many more high‑quality LLM trajectories before the student can reliably match the teacher.
+
+Areas for further improvement
+
+Fine‑tune the death-sensitive threshold: The current scheme lowers k linearly with deaths. If deaths remain clustered, you might make k decay more aggressively (e.g. subtract 0.75 per death instead of 0.5) or combine it with a decaying death_density metric so that k rises again only after extended survival. This will make ruptures trigger earlier in persistent death traps.
+
+Expand and weight the demonstration buffer: Ensure that every teacher decision (LLM or heuristic) is stored with a survival-weighted reward so that the offline trainer emphasises actions that lead to longer survival. You might also sample more demonstrations per behaviour‑cloning update to accelerate learning.
+
+Enhance state encoding: The current policy uses 34‑dimensional inputs with food/hazard direction cues. Additional features such as counts of recent deaths or local curvature might help the learner recognise death traps without waiting for curvature peaks.
+
+Consider macro‑actions and recognisers: The tool registry is still flat. Allowing the LLM to define macros (e.g. “forage_water” as a sequence of examine → move → consume) within a constrained schema could encapsulate successful strategies and reduce LLM calls further. Similarly, adding simple recognisers (e.g. “hazard corridor” or “resource cluster”) to the state vector could give the learner more context.
+
+Monitor regime transitions: Borrowing from the Émile-cogito notebook, you could detect when the agent spends too long in a particular zone (healthy/struggling/crisis). If it oscillates between struggling and crisis despite ruptures, that may signal that world parameters (food density, hazard migration) need adjustment or that the learned policy needs more training data.
+
+Conclusion
+
+The new commit is a significant step forward: the adaptive threshold and dwell logic reduce unnecessary LLM usage and prevent the agent from normalising repeated deaths. However, the underlying survival policy still needs improvement. Continue building the demonstration buffer, adjust the death‑sensitive k decay, and consider richer state representations and macro‑actions to give the agent a better chance to break out of death traps permanently.
+
+social_qse_agent_v2.py
+Python
+Think it emile-Kosmos is at the stage where I could also think about implementing the attached module?
+
+The social_qse_agent_v2.py file is a major extension of the QSE‑Émile framework that introduces multi‑agent social cognition. A quick scan of its 1,150 lines shows that it builds on EmbodiedQSEAgent and EmbodiedEnvironment and adds:
+
+Social signals and embodied signatures: agents can send help, warning, share, compete, teach, follow and avoid signals that carry an embodied “feeling” and optional data payload.
+
+Social memory and relationship tracking: each SocialQSEAgent maintains histories of interactions, social relationships, pending teach requests, and episodic surplus memory. These are used to modulate behaviour across episodes and agents.
+
+Context‑dependent social strategies: agents choose between cooperative, competitive, teaching, learning and independent modes based on nearby agents and their own internal QSE state. The social_embodied_step method orchestrates movement, energy changes, social sensing, signal processing, strategy selection, teaching and acting every step.
+
+Multi‑agent environment: the environment can add multiple agents, place them in a grid and manage shared resources (like fruit) and social signals. An analyze_spatial_dynamics function (beyond the snippet shown) helps study collective behaviour over time.
+
+This module is far richer than the current single‑agent Kosmos setup. In Kosmos, you’ve just added the Surplus/Tension module, adaptive rupture thresholds, strategy‑dwell time and a demonstration buffer. The learned policy is still stabilising and deaths still cluster in certain regions, so survival is not yet robust. Introducing multi‑agent social dynamics at this stage could swamp the learning process and make it hard to diagnose problems: the agent would be dealing with other agents’ actions, new resources, social signals and cooperative/competitive decisions in addition to its own survival.
+
+That said, the ideas in social_qse_agent_v2.py are valuable:
+
+The embodied social signals mirror your current notion of “affordances” and could inspire a way to let the Kosmos LLM propose macros or recognisers.
+
+The episodic surplus memory ties in with your plan to record demonstrations and use them for offline consolidation.
+
+The existential pressure system (modifying surplus and energy depending on movement/stagnation) echoes your curvature‑based tension calculations in Kosmos.
+
+Recommendation: don’t integrate this module wholesale into Kosmos yet. Continue to improve single‑agent survival and demonstration‑based learning; once the base agent reliably sustains itself, you can explore adding a second agent and gradually introducing social interactions. If you want to get started now, pick out specific patterns from social_qse_agent_v2.py—for example, how it tracks social memory or chooses strategies—and adapt them into your existing architecture rather than trying to run the whole multi‑agent system on top of Kosmos.
