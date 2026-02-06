@@ -751,7 +751,10 @@ class KosmosAgent:
 
         # 5. Teacher-student decision (gated by consciousness zone)
         # In crisis zone, ALWAYS use heuristic — survival reflex override
-        if self._consciousness_zone == "crisis":
+        # EXCEPTION: If rupture triggered this tick, bypass crisis override
+        # The heuristic itself may be causing the death loop - let LLM replan
+        rupture_override = self._st_metrics.get("should_rupture", False)
+        if self._consciousness_zone == "crisis" and not rupture_override:
             # Abort any active plan in crisis
             if self._current_plan:
                 self._current_plan.clear()
