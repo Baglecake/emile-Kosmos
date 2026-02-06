@@ -1173,6 +1173,13 @@ class KosmosAgent:
         if tool_name == "consume" and "Nothing to consume" in res:
             r -= 0.1  # wasted action
 
+        # Phase 6d: Intrinsic reward shaping from surplus/tension
+        # - High surplus (surprise) = small exploration bonus
+        # - High curvature (structured failure) = penalty
+        # Scaled down so survival rewards still dominate
+        intrinsic = self.surplus_tension.get_intrinsic_reward()
+        r += intrinsic
+
         return float(np.clip(r, -1.0, 1.0))
 
     def _heuristic_decide(self) -> dict:
