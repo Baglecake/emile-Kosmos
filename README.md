@@ -1,5 +1,9 @@
 # emile-Kosmos
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
+[![University of Toronto](https://img.shields.io/badge/University%20of%20Toronto-Graduate%20Research-002A5C)](https://www.utoronto.ca/)
+
 An autonomous agent simulation combining biologically-inspired cognitive dynamics with large language model reasoning. The agent survives in a procedurally generated world, making decisions through a hybrid architecture that integrates continuous neural field dynamics with structured tool use.
 
 ## Overview
