@@ -204,6 +204,12 @@ class KosmosAgent:
         self.surplus_tension = SurplusTensionModule()
         self._st_metrics: dict = {}  # Latest surplus/tension metrics
 
+        # Phase 6e: Cognitive integrity tracking
+        self._decision_history: list[str] = []  # History of decision sources
+        self._plans_started = 0  # Count of plans initiated
+        self._plans_completed = 0  # Count of plans completed (all steps executed)
+        self._cognitive_integrity: dict = {}  # Latest integrity metrics
+
     # ------------------------------------------------------------------ #
     #  Tool binding                                                        #
     # ------------------------------------------------------------------ #
@@ -723,22 +729,7 @@ class KosmosAgent:
 
         # Check for rupture (Phase 6c - escape death traps)
         if self._st_metrics.get("should_rupture", False):
-            k_eff = self._st_metrics.get('k_effective', 2.0)
-            print(f"[RUPTURE t={self.total_ticks}] Σ={self._st_metrics['sigma_ema']:.2f} "
-                  f"k={k_eff:.1f} pos={self.pos} ruptures={self.surplus_tension.ruptures_triggered}")
-            # Clear current plan and force replan
-            self._current_plan.clear()
-            self._plan_goal = ""
-            # Mark stuckness to trigger escape behavior in heuristic
-            self._is_stuck = True
-            self._stuck_ticks = 10  # Force escape
-            # Reset strategy dwell to allow immediate strategy pivot
-            self._strategy_dwell_ticks = 0
-            self._pending_strategy = None
-            # Reset internal model for fresh start
-            self.surplus_tension.on_rupture()
-            # Force LLM call for new plan
-            self._ticks_since_llm = 999
+            self._execute_rupture()
 
         # 4.6 Consciousness zone classification (for survival override)
         # Crisis: force heuristic survival actions, no learned policy
@@ -791,6 +782,9 @@ class KosmosAgent:
             if self._use_planning and self._current_plan:
                 decision = self._current_plan.pop(0)
                 self._decision_source = "teacher_plan"
+                # Phase 6e: Track plan completion
+                if not self._current_plan:
+                    self._plans_completed += 1
             elif self._llm_pending is not None:
                 # Check if pending LLM result is a plan or single action
                 staleness = self.total_ticks - self._llm_pending_tick
@@ -802,6 +796,7 @@ class KosmosAgent:
                         self._plan_goal = pending.get("goal", "")
                         self._plan_replan_if = pending.get("replan_if", [])
                         self._plan_strategy = self.strategy
+                        self._plans_started += 1  # Phase 6e: Track plan start
                         if self._current_plan:
                             decision = self._current_plan.pop(0)
                             self._decision_source = "teacher_plan"
@@ -819,6 +814,11 @@ class KosmosAgent:
             else:
                 decision = self._heuristic_decide()
                 self._decision_source = "teacher_heuristic"
+
+        # Phase 6e: Track decision for cognitive integrity
+        self._decision_history.append(self._decision_source)
+        if len(self._decision_history) > 200:
+            self._decision_history = self._decision_history[-200:]
 
         # Fire off next LLM reasoning in background (event-triggered, 5b)
         # Only fire if we don't have an active plan (or plan is almost done)
@@ -1059,6 +1059,10 @@ class KosmosAgent:
         self._recent_actions.append(granular_action)
         if len(self._recent_actions) > self._action_repeat_window:
             self._recent_actions = self._recent_actions[-self._action_repeat_window:]
+
+        # 14. Phase 6e: Compute cognitive integrity periodically
+        if self.total_ticks % 50 == 0:
+            self._cognitive_integrity = self.surplus_tension.compute_cognitive_integrity(self)
 
         self.last_action = {
             "tool": tool_name,
@@ -1384,6 +1388,114 @@ class KosmosAgent:
 
         return self._is_stuck
 
+    def _execute_rupture(self):
+        """
+        Execute cognitive rupture (Phase 6c): forced relocation and cognitive reset.
+
+        Rupture is triggered when curvature Σ exceeds threshold, indicating
+        a structured failure pattern (death trap). The agent:
+        1. Clears current plan
+        2. Computes escape direction AWAY from recent death locations
+        3. Moves several cells in escape direction
+        4. Resets internal model expectations
+        5. Forces LLM replan for new situation
+
+        This implements the theoretical "rupture expulsion" from QSE dynamics:
+        when |σ| > threshold, the system expels accumulated tension.
+        """
+        k_eff = self._st_metrics.get('k_effective', 2.0)
+        print(f"[RUPTURE t={self.total_ticks}] Σ={self._st_metrics['sigma_ema']:.2f} "
+              f"k={k_eff:.1f} pos={self.pos} ruptures={self.surplus_tension.ruptures_triggered}")
+
+        # 1. Clear current plan
+        self._current_plan.clear()
+        self._plan_goal = ""
+
+        # 2. Compute escape direction: move AWAY from death cluster
+        escape_dir = self._compute_escape_direction()
+
+        # 3. Execute escape moves (3-5 cells in escape direction)
+        escape_moves = 4
+        for _ in range(escape_moves):
+            result = self._tool_move(escape_dir)
+            if "Blocked" in result:
+                # Hit edge or obstacle, try perpendicular directions
+                perp_dirs = {"north": ["east", "west"], "south": ["east", "west"],
+                             "east": ["north", "south"], "west": ["north", "south"]}
+                for alt_dir in perp_dirs.get(escape_dir, ["east"]):
+                    result = self._tool_move(alt_dir)
+                    if "Blocked" not in result:
+                        escape_dir = alt_dir  # Update escape direction
+                        break
+
+        # 4. Mark stuckness cleared (we've escaped)
+        self._is_stuck = False
+        self._stuck_ticks = 0
+
+        # 5. Reset strategy dwell to allow immediate strategy pivot
+        self._strategy_dwell_ticks = 0
+        self._pending_strategy = None
+
+        # 6. Temporarily boost teacher probability (need guidance in new area)
+        self._teacher_prob = min(0.9, self._teacher_prob + 0.15)
+
+        # 7. Reset internal model (fresh expectations for new location)
+        self.surplus_tension.on_rupture()
+
+        # 8. Clear food memory (old locations may not apply)
+        self._last_known_food_pos = None
+
+        # 9. Force LLM call for new plan
+        self._ticks_since_llm = 999
+
+        # 10. Record rupture in memory
+        self._remember(f"Rupture escape at {self.pos}. Fleeing death trap, seeking new area.")
+
+    def _compute_escape_direction(self) -> str:
+        """
+        Compute escape direction AWAY from recent death cluster.
+
+        Uses death history from surplus_tension module to find centroid
+        of recent deaths, then returns direction away from that point.
+        """
+        death_ticks = self.surplus_tension.death_ticks
+
+        if not death_ticks:
+            # No death history, escape in random direction not recently used
+            recent_moves = [a for a in self._recent_actions if a.startswith("move_")]
+            if recent_moves:
+                # Avoid most recent direction
+                last_dir = recent_moves[-1].replace("move_", "")
+                opposite = {"north": "south", "south": "north",
+                            "east": "west", "west": "east"}
+                return opposite.get(last_dir, "north")
+            return "north"
+
+        # Approximate death centroid using recent positions around death times
+        # Since we don't track exact death positions, use current position
+        # and move away from the "stuck" area (recent_positions centroid)
+        if len(self._recent_positions) >= 10:
+            recent = self._recent_positions[-10:]
+            centroid_r = sum(p[0] for p in recent) / len(recent)
+            centroid_c = sum(p[1] for p in recent) / len(recent)
+
+            # Direction FROM centroid TO current position = where we've been going
+            # We want the OPPOSITE = away from where we've been stuck
+            dr = self.pos[0] - centroid_r
+            dc = self.pos[1] - centroid_c
+
+            # If we're at centroid, just pick any direction
+            if abs(dr) < 0.5 and abs(dc) < 0.5:
+                return "north"
+
+            # Move in direction away from centroid
+            if abs(dr) >= abs(dc):
+                return "south" if dr > 0 else "north"
+            else:
+                return "east" if dc > 0 else "west"
+
+        return "north"
+
     def _check_plan_interrupt(self) -> tuple[bool, str]:
         """
         Check if current plan should be interrupted.
@@ -1592,4 +1704,11 @@ class KosmosAgent:
             "dynamic_threshold": self._st_metrics.get("dynamic_threshold", 0.65),
             "k_effective": self._st_metrics.get("k_effective", 2.0),
             "ruptures": self.surplus_tension.ruptures_triggered,
+            # Phase 6e: Cognitive integrity
+            "collaboration": self._cognitive_integrity.get("collaboration", 0.5),
+            "compromise": self._cognitive_integrity.get("compromise", 0.5),
+            "integrity": self._cognitive_integrity.get("integrity", 0.0),
+            "diversity": self._cognitive_integrity.get("diversity", 0.5),
+            "plans_started": self._plans_started,
+            "plans_completed": self._plans_completed,
         }

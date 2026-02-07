@@ -441,6 +441,40 @@ class KosmosRenderer:
                        (180, 160, 80), (120, 80, 220))
         y += 22
 
+        # Phase 6 metrics: Surplus/Tension
+        y += 4
+        self._text(panel_x, y, "-- Surplus/Tension --", self.font_sm, TEXT_MED)
+        y += 16
+
+        # Surplus S bar (surprise magnitude)
+        surplus = state.get("surplus_ema", 0.0)
+        self._draw_bar(panel_x, y, "Surplus", min(1.0, surplus),
+                       (200, 140, 80), (60, 60, 80))
+        y += 22
+
+        # Curvature Σ bar (structural tension)
+        sigma = state.get("sigma_ema", 0.0)
+        sigma_color = (220, 80, 80) if sigma > 0.6 else (180, 140, 100)
+        self._draw_bar(panel_x, y, "Curv Σ", sigma,
+                       sigma_color, (60, 60, 80))
+        y += 22
+
+        # τ′ emergent time and ruptures
+        tau_prime = state.get("tau_prime", 1.0)
+        ruptures = state.get("ruptures", 0)
+        self._text(panel_x, y, f"τ′: {tau_prime:.2f}  Ruptures: {ruptures}",
+                   self.font_sm, (140, 160, 180))
+        y += 16
+
+        # Cognitive integrity bar
+        integrity = state.get("integrity", 0.0)
+        # Map integrity from [-1, 1] to [0, 1] for bar display
+        integrity_norm = (integrity + 1.0) / 2.0
+        int_color = (80, 180, 120) if integrity > 0 else (180, 80, 80)
+        self._draw_bar(panel_x, y, "Integr", integrity_norm,
+                       int_color, (100, 100, 100))
+        y += 22
+
         # LLM temp
         temp = 0.3 + state["entropy"] * 1.2
         self._text(panel_x, y, f"LLM Temp: {temp:.2f}", self.font_sm, TEXT_DIM)

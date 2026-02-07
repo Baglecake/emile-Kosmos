@@ -426,6 +426,97 @@ class SurplusTensionModule:
 
         return surprise_reward - curvature_penalty
 
+    def compute_cognitive_integrity(self, agent: "KosmosAgent") -> dict:
+        """
+        Measure cognitive integrity: collaboration vs compromise.
+
+        From Antifinity framework:
+        - Collaboration: Multiple decision sources contributing additively,
+          expanding capability while preserving each source's "elemental truth"
+        - Compromise: System collapsing to single mode, reducing potential,
+          "flattening" the internal diversity
+
+        Metrics:
+        - diversity: entropy of decision source distribution (high = healthy)
+        - plan_stability: how often plans complete vs abort (high = coherent)
+        - collaboration: composite score of additive integration
+        - compromise: indicators of reductive collapse
+        - integrity: net cognitive health (collaboration - compromise)
+
+        Returns dict with all metrics for dashboard display.
+        """
+        # Get decision history from agent
+        # Track last 100 decisions for meaningful statistics
+        decision_history = getattr(agent, '_decision_history', [])
+        if not decision_history:
+            # Initialize tracking if not present
+            return {
+                'collaboration': 0.5,
+                'compromise': 0.5,
+                'integrity': 0.0,
+                'diversity': 0.5,
+                'plan_stability': 0.5,
+            }
+
+        recent = decision_history[-100:] if len(decision_history) > 100 else decision_history
+
+        # 1. Decision source diversity (entropy of distribution)
+        from collections import Counter
+        source_counts = Counter(recent)
+        total = sum(source_counts.values())
+
+        if total == 0:
+            diversity = 0.5
+        else:
+            probs = [c / total for c in source_counts.values()]
+            # Shannon entropy, normalized by max possible (log of num sources)
+            import math
+            entropy = -sum(p * math.log(p + 1e-10) for p in probs)
+            max_entropy = math.log(max(len(source_counts), 1) + 1e-10)
+            diversity = entropy / max_entropy if max_entropy > 0 else 0
+
+        # 2. Plan stability: completed plans / started plans
+        plans_started = getattr(agent, '_plans_started', 0)
+        plans_completed = getattr(agent, '_plans_completed', 0)
+        plan_stability = plans_completed / max(1, plans_started)
+
+        # 3. Collaboration score: weighted sum of positive indicators
+        # - High diversity = multiple sources contributing
+        # - Good plan stability = coherent execution
+        # - Moderate teacher prob = balance between learning and teaching
+        teacher_prob = getattr(agent, '_teacher_prob', 0.5)
+        teacher_balance = 1.0 - abs(teacher_prob - 0.5) * 2  # Peak at 0.5
+
+        collaboration = 0.4 * diversity + 0.4 * plan_stability + 0.2 * teacher_balance
+
+        # 4. Compromise indicators: signs of reductive collapse
+        # - Survival reflex dominance = crisis mode taking over
+        # - Single source dominance = one mode suppressing others
+        # - Low sigma_ema with deaths = normalized deviance (accepting bad patterns)
+
+        survival_dominance = source_counts.get('survival_reflex', 0) / max(1, total)
+        single_dominance = max(source_counts.values()) / max(1, total) if source_counts else 0
+
+        # Normalized deviance: low curvature despite recent deaths
+        recent_deaths = len([t for t in self.death_ticks if agent.total_ticks - t < 200])
+        normalized_deviance = 0.0
+        if recent_deaths > 0 and self.sigma_ema < 0.3:
+            normalized_deviance = 0.3 * recent_deaths  # System accepting failures
+
+        compromise = 0.4 * survival_dominance + 0.4 * (single_dominance - 0.5) + 0.2 * normalized_deviance
+        compromise = float(np.clip(compromise, 0.0, 1.0))
+
+        # 5. Net integrity: collaboration minus compromise
+        integrity = collaboration - compromise
+
+        return {
+            'collaboration': float(np.clip(collaboration, 0.0, 1.0)),
+            'compromise': float(np.clip(compromise, 0.0, 1.0)),
+            'integrity': float(np.clip(integrity, -1.0, 1.0)),
+            'diversity': float(np.clip(diversity, 0.0, 1.0)),
+            'plan_stability': float(np.clip(plan_stability, 0.0, 1.0)),
+        }
+
     def to_dict(self) -> dict:
         """Serialize for persistence."""
         return {
