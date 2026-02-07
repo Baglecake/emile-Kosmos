@@ -158,37 +158,38 @@ Each run generates:
 
 ## Theoretical Foundations
 
-This project draws on several intersecting research traditions. See `source_notes.md` for detailed summaries.
+This project integrates perspectives from philosophy of mind, social theory, and AI research. The architecture treats cognition as situated and distributed rather than isolated: a coupled system spanning agent, environment, and cultural artifacts. Key commitments include treating meaning as constituted through sequential interaction (not retrieved from static representations), evaluating competence relationally within bounded contexts, and modeling the accumulation of cognitive modifications across agent-environment exchanges.
 
-### Cognition as Situated and Extended
+See `source_notes.md` for detailed summaries of each source.
 
-The architecture treats cognition not as isolated computation but as a coupled system spanning agent and environment. This follows Clark and Chalmers' (1998) "extended mind" thesis and Heyes' (2018) argument that distinctively human cognitive mechanisms are "cultural gadgets" constructed through social interaction rather than genetic inheritance.
+### References
 
-### Sociogenesis and Shared Intentionality
-
-Tomasello's (1999) account of human cultural origins informs the teacher-student dynamics: the capacity for joint attention and imitative learning enables the "ratchet effect" where cognitive modifications accumulate across interactions. The project explores whether similar dynamics can emerge in human-AI collaboration.
-
-### Constitutive Practice and Sequential Organization
-
-Rawls' (2011) reading of Durkheim and Wittgenstein emphasizes that meaning is constituted through sequential interaction, not retrieved from static representations. The agent's multi-step planning and context-sensitive plan validation reflect this view: plans are accepted or rejected based on whether the current interactional context matches the context of their production.
-
-### Situated Intelligence
-
-Following Ratto's (2025) critique of "artificial general intelligence" as a sociotechnical imaginary, this project pursues what might be called artificial contextual intelligence: systems designed to operate within bounded milieus rather than abstracting away from context. Competence is evaluated relationally, by how well the system coordinates activity within its specific environment.
-
-### Symbolic Behavior as Convention
-
-Santoro et al. (2022) argue that symbolic fluency requires not just pattern recognition but the capacity to construct and modify conventions. The intent system roadmap aims toward this: the LLM specifies goals and constraints (conventions), while the embodied agent learns to satisfy them through grounded interaction.
-
-### Key References
+**Philosophy of Mind and Cognitive Science**
 
 - Clark, A. & Chalmers, D. (1998). The extended mind. *Analysis*, 58(1), 7-19.
 - Heyes, C. (2018). *Cognitive gadgets: The cultural evolution of thinking*. Harvard University Press.
-- Rawls, A. (2011). Wittgenstein, Durkheim, Garfinkel and Winch. *Journal for the Theory of Social Behaviour*, 41(4), 396-418.
-- Ratto, M. (2025). Is intelligence general?
-- Santoro, A. et al. (2022). Symbolic behaviour in artificial intelligence. arXiv:2102.03406.
-- Shanahan, M. et al. (2023). Role-play with large language models. arXiv:2305.16367.
 - Tomasello, M. (1999). *The cultural origins of human cognition*. Harvard University Press.
+
+**Social Theory and Practice**
+
+- Rawls, A.W. *Epistemology and Practice: Durkheim's The Elementary Forms of Religious Life*. (Introduction, Chs. 8, 10).
+- Rawls, A.W. (2011). Wittgenstein, Durkheim, Garfinkel and Winch: Constitutive orders of sensemaking. *Journal for the Theory of Social Behaviour*, 41(4), 396-418.
+- Simmel, G. How is society possible? (Three a prioris).
+
+**AI and Social Intelligence**
+
+- Bokanga, M., Lembo, A., & Martin, J.L. (2023). Through a scanner darkly: Machine sentience and the language virus. *Journal of Social Computing*, 4(4), 254-269.
+- Carley, K. (1996). Artificial intelligence within sociology.
+- Li, C., Chen, M., Wang, J., Sitaram, S., & Xie, X. (2024). CultureLLM: Incorporating cultural differences into large language models. arXiv:2402.10946.
+- Mathur, L., Liang, P.P., & Morency, L.-P. (2024). Advancing social intelligence in AI agents: Technical challenges and open questions.
+- Ratto, M. (2025). Is intelligence general?
+- Santoro, A., Lampinen, A., Mathewson, K., Lillicrap, T., & Raposo, D. (2022). Symbolic behaviour in artificial intelligence. arXiv:2102.03406.
+- Shanahan, M., McDonell, K., & Reynolds, L. (2023). Role-play with large language models. arXiv:2305.16367.
+
+**Project-Specific Theory**
+
+- Coburn, D. (2026). Sociogenesis as being-in-addition-to-itself: A phenomenological reading of Tomasello.
+- Coburn, D. (2026). Synthetic sociogenesis: Agentic AI as a cybernetic feedback loop.
 
 ## License
 
