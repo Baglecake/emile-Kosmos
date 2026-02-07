@@ -156,9 +156,9 @@ Each run generates:
 
 ## Documentation
 
-- `archive/docs/ARCHITECTURE.md`: Detailed system architecture
-- `archive/docs/ROADMAP_INTENT.md`: Intent system design
-- `archive/docs/ROADMAP_SURPLUS_TENSION.md`: Cognitive dynamics specification
+- `docs/ARCHITECTURE.md`: Detailed system architecture
+- `docs/ROADMAP_INTENT.md`: Intent system design
+- `docs/ROADMAP_SURPLUS_TENSION.md`: Cognitive dynamics specification
 
 ## Theoretical Foundations
 
