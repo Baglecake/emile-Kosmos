@@ -1,39 +1,53 @@
-# émile-Kosmos
+# emile-Kosmos
 
-A living world simulation where an autonomous agent survives in a procedurally
-generated environment. The agent's cognition is driven by a **Quantum Surplus
-Emergence (QSE)** wavefunction that modulates an LLM's creativity and
-personality in real time.
+An autonomous agent simulation combining biologically-inspired cognitive dynamics with large language model reasoning. The agent survives in a procedurally generated world, making decisions through a hybrid architecture that integrates continuous neural field dynamics with structured tool use.
 
-## The QSE Innovation
+## Overview
 
-Traditional AI agents use fixed decision logic or static LLM prompts.
-emile-Kosmos introduces a fundamentally different approach:
+emile-Kosmos addresses a fundamental limitation of LLM-based agents: static decision-making. Rather than using fixed prompts or simple rule-based systems, this project implements a **cognitive dynamics layer** that modulates the LLM's behavior in real time based on the agent's internal state and environmental context.
 
-- A **quantum wavefunction** evolves continuously (20 Hz) via split-step FFT
-  Schrodinger dynamics
-- **Shannon entropy** of |psi|^2 determines the LLM's temperature: high entropy
-  (spread-out wavefunction) = creative/divergent thinking; low entropy (peaked
-  wavefunction) = focused/convergent thinking
-- **TD(lambda)** learns which cognitive strategies (explore, exploit, rest,
-  learn, social) work in which contexts
-- The QSE strategy also shifts the LLM's entire **personality** via system
-  prompt, creating qualitatively different behavior modes
+The core innovation is treating cognition as a continuous dynamical system rather than discrete query-response cycles. The agent's "mental state" evolves according to field equations, and this evolution determines both *what* the agent considers and *how* it reasons.
 
-The result: an agent with genuine cognitive dynamics, not just reactive
-decision-making.
+## Cognitive Architecture
 
-Built on the [emile-mini](https://github.com/Baglecake/emile-mini) QSE
-cognitive engine.
+The system implements a three-layer decision hierarchy:
+
+### Layer 1: Strategy Selection
+A temporal-difference learning module (TD-lambda) selects abstract cognitive strategies: explore, exploit, rest, learn, or social. Strategy selection adapts based on environmental feedback and internal state.
+
+### Layer 2: Goal Mapping
+Strategies are translated into concrete embodied goals (seek food, find water, avoid hazards, etc.) through a learned mapping that considers the agent's current resources and nearby affordances.
+
+### Layer 3: Action Policy
+Goals are executed through either:
+- A learned neural policy trained via behavior cloning from successful demonstrations
+- Heuristic reflexes for survival-critical situations
+- LLM-guided planning for novel or complex situations
+
+### Cognitive Dynamics Engine
+
+The underlying cognitive engine (vendored from [emile-mini](https://github.com/Baglecake/emile-mini)) models internal state as a probability distribution evolving via Schrodinger-like dynamics:
+
+- **Entropy** of the distribution modulates decision temperature: high entropy leads to exploratory behavior; low entropy leads to focused exploitation
+- **Surplus** measures discrepancy between expected and observed states, driving learning and adaptation
+- **Curvature** tracks structural patterns in failure, triggering cognitive "ruptures" that force exploration of new strategies
+
+This provides principled answers to questions like "when should the agent explore vs exploit?" and "when should it abandon a failing strategy?"
+
+## Key Features
+
+- **Survival mechanics**: Energy, hydration, day/night cycles, weather events, seasonal variation
+- **Tool-based actions**: Move, examine, consume, craft, plant, rest, remember
+- **Multi-step planning**: LLM generates action sequences with explicit goals and replan conditions
+- **Context-aware plan validation**: Plans are accepted only if the current situation matches the context when they were requested
+- **Teacher-student learning**: LLM decisions are used to train the neural policy, with gradual handoff as competence increases
+- **Structured logging**: Detailed event logs and metrics for analysis and debugging
 
 ## Requirements
 
-- Python >= 3.10
-- numpy >= 1.23
-- scipy >= 1.10
-- pygame-ce >= 2.4
-- requests >= 2.28
-- [Ollama](https://ollama.com) (local LLM server) -- optional but recommended
+- Python 3.10 or later
+- numpy, scipy, pygame-ce, requests
+- Ollama (optional, for LLM reasoning)
 
 ## Installation
 
@@ -45,25 +59,23 @@ pip install -e .
 
 ### Ollama Setup (Optional)
 
-The agent uses a local LLM via Ollama for reasoning and narration. Without
-Ollama, the agent falls back to heuristic decision-making.
+The agent uses a local LLM via Ollama for reasoning. Without Ollama, the agent operates using heuristic decision-making only.
 
 ```bash
-# Install Ollama
+# Install Ollama (macOS/Linux)
 curl -fsSL https://ollama.com/install.sh | sh
 
-# Pull a model (pick one)
-ollama pull phi3:mini      # Fastest, good for tool calls
-ollama pull llama3.1:8b    # Better quality reasoning
+# Pull a model
+ollama pull llama3.1:8b
 ```
 
-## Running
+## Usage
 
 ```bash
 python -m kosmos
 ```
 
-### Options
+### Command-Line Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -71,78 +83,83 @@ python -m kosmos
 | `--size SIZE` | `30` | World grid dimension |
 | `--speed SPEED` | `8` | Simulation ticks per second |
 | `--seed SEED` | random | World generation seed |
+| `--save PATH` | none | Save state on exit |
+| `--load PATH` | none | Load state on start |
 
-Example:
-
-```bash
-python -m kosmos --model phi3:mini --size 40 --speed 12
-```
-
-## Controls
+### Controls
 
 | Key | Action |
 |-----|--------|
-| SPACE | Pause / Resume |
-| UP / DOWN | Increase / Decrease speed |
-| Q / ESC | Quit |
+| Space | Pause/Resume |
+| Up/Down | Adjust speed |
+| Q/Escape | Quit |
 
-## Architecture Overview
+## Project Structure
 
 ```
-emile_mini/           Vendored QSE cognitive engine (v0.6.0)
-  qse_core.py         Schrodinger evolution + surplus dynamics
-  agent.py            EmileAgent: cognitive orchestration loop
-  symbolic.py         Psi/Phi/Sigma field computation
-  goal_v2.py          TD(lambda) strategy selection
-  context.py          Hysteresis-based context switching
-  memory.py           Working + episodic + semantic memory
-  config.py           52 tunable QSE parameters
+emile_mini/                 Vendored cognitive engine
+  qse_core.py               Field dynamics and surplus computation
+  goal_v2.py                TD-lambda strategy selection
+  goal_mapper.py            Strategy to goal mapping
+  symbolic.py               Symbolic field computation
 
-kosmos/               The Kosmos application
-  __main__.py          Entry point, CLI args
-  world/
-    grid.py            Procedural biome grid, day/night, seasons
-    objects.py         Food, Water, Hazard, CraftItem + recipes
+kosmos/                     Application code
   agent/
-    core.py            KosmosAgent: QSE + tools + LLM + survival
-  tools/
-    registry.py        Extensible tool system with JSON schemas
-    builtins.py        8 built-in tools (move, examine, consume, ...)
+    core.py                 Main agent loop and decision logic
+    action_policy.py        Neural policy (MLP + REINFORCE)
+    surplus_tension.py      Surplus/curvature metrics
+    demo_buffer.py          Behavior cloning buffer
+  world/
+    grid.py                 Procedural world generation
+    objects.py              Game objects and crafting
+    weather.py              Weather system
   llm/
-    ollama.py          QSE-modulated LLM with structured tool calls
+    ollama.py               LLM interface with structured output
+  tools/
+    registry.py             Tool registration system
+    builtins.py             Built-in tool definitions
   render/
-    pygame_render.py   Pygame visualization with info panels
+    pygame_render.py        Visualization
+  logging_config.py         Structured logging
+  persistence.py            Save/load functionality
 ```
 
-### Cognitive Loop (each tick)
+## Development Status
 
-1. QSE wavefunction evolves, producing entropy and context dynamics
-2. TD(lambda) selects a cognitive strategy (explore/exploit/rest/learn/social)
-3. Strategy modulates which tools the LLM sees and its personality
-4. LLM reasons about available tools and returns a structured action (or heuristic fallback)
-5. Tool executes in the world (move, eat, craft, examine, etc.)
-6. Reward feeds back to both TD(lambda) and QSE engine
+### Completed
 
-### The World
+- Three-layer cognitive architecture (strategy, goal, action)
+- Survival mechanics with tuned metabolism
+- Weather system (rain, storm, heat wave, fog, wind)
+- Crafting and agriculture (herbs, seeds, planted crops)
+- Multi-step LLM planning with interrupt handling
+- Event-triggered LLM firing based on context changes
+- Surplus-tension module for principled exploration/exploitation
+- Cognitive integrity metrics (collaboration vs. compromise)
+- Context-aware plan validation (state-validity checking)
+- Structured logging and metrics output
 
-- **Biomes**: plains, forest, desert, water, rock -- each with different movement costs
-- **Day/night cycle**: 200 ticks per day, night increases movement cost
-- **Seasons**: spring/summer/autumn/winter (800 ticks each) affect food and hazard spawn rates
-- **Food migration**: resources decay over time and respawn in new locations
-- **Crafting**: combine materials (stick + stone = axe, etc.) for survival bonuses
-- **Real death**: energy depletion kills the agent; respawn with memories but lose inventory
+### In Progress
 
-## Development Roadmap
+- Intent system: shifting LLM from micro-planning to goal/quota specification
+- Multi-agent scenarios with social dynamics
 
-- **Phase 1**: Wire learning layers (GoalMapper L2, ActionPolicy L3 with
-  LLM-as-teacher decay)
-- **Phase 2**: Richer world (weather events, more objects, world save/load)
-- **Phase 3**: Multi-agent (shared world, social learning, resource competition)
-- **Phase 4**: Better LLM integration (multi-turn reasoning, async calls,
-  teacher-student handoff metrics)
-- **Phase 5**: UI/UX (mouse interaction, minimap, dashboards, live parameter
-  tuning)
+## Output Files
+
+Each run generates:
+- `runs/latest.log`: Human-readable event log
+- `runs/latest_metrics.jsonl`: Structured metrics (one JSON object per 10 ticks)
+
+## Documentation
+
+- `archive/docs/ARCHITECTURE.md`: Detailed system architecture
+- `archive/docs/ROADMAP_INTENT.md`: Intent system design
+- `archive/docs/ROADMAP_SURPLUS_TENSION.md`: Cognitive dynamics specification
 
 ## License
 
 MIT
+
+## Acknowledgments
+
+Built on the emile-mini cognitive engine. Theoretical foundations draw on work in embodied cognition, active inference, and dynamical systems approaches to mind.

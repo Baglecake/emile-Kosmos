@@ -5,9 +5,13 @@ from .world.grid import KosmosWorld
 from .agent.core import KosmosAgent
 from .render.pygame_render import KosmosRenderer
 from .persistence import save_state, load_state
+from .logging_config import setup_logging, get_logger
 
 
 def main():
+    # Initialize logging (clears previous run)
+    setup_logging()
+    logger = get_logger()
     # Parse args
     model = "llama3.1:8b"
     size = 30
@@ -47,8 +51,11 @@ def main():
         else:
             i += 1
 
+    logger.info(f"emile-Kosmos starting")
+    logger.info(f"World: {size}x{size}  Model: {model}  Speed: {speed}/s")
     print(f"  emile-Kosmos")
     print(f"  World: {size}x{size}  Model: {model}  Speed: {speed}/s")
+    print(f"  Logs: runs/latest.log | Metrics: runs/latest_metrics.jsonl")
 
     world = KosmosWorld(size=size, seed=seed)
     agent = KosmosAgent(world, model=model)

@@ -26,6 +26,7 @@ from .action_policy import (
 )
 from .demo_buffer import DemonstrationBuffer, behavior_cloning_update
 from .surplus_tension import SurplusTensionModule
+from ..logging_config import log_metrics, log_llm_event, log_death, log_rupture, get_logger
 
 
 DIRECTIONS = {
@@ -34,6 +35,69 @@ DIRECTIONS = {
     "east": (0, 1),
     "west": (0, -1),
 }
+
+
+# Phase 1 Intent Roadmap: SituationSignature for state-validity checking
+from dataclasses import dataclass
+
+@dataclass
+class SituationSignature:
+    """
+    Lightweight context snapshot for validating LLM plan relevance.
+
+    Instead of using tick-based staleness, we compare the situation
+    when the LLM was called vs the current situation. If they differ
+    significantly, the plan is rejected as contextually irrelevant.
+    """
+    zone: str           # crisis/struggling/healthy/transcendent
+    energy_band: int    # 0=critical(<0.25), 1=low(<0.45), 2=ok(<0.7), 3=high
+    hydration_band: int # same bands as energy
+    strategy: str       # current L1 strategy
+    has_food_nearby: bool   # food within radius 3
+    has_hazard_nearby: bool # hazard within radius 2
+    weather: str        # current weather type
+    biome: str          # biome at current position
+
+    def matches(self, other: "SituationSignature", strict: bool = False) -> bool:
+        """
+        Check if two signatures are "close enough" for plan validity.
+
+        Critical fields (zone, strategy) must always match.
+        Non-critical fields (weather, biome) are checked only in strict mode.
+        Band differences of 1 are tolerated (e.g., energy went from ok to low).
+        """
+        # Critical: zone and strategy must match
+        if self.zone != other.zone or self.strategy != other.strategy:
+            return False
+
+        # Energy and hydration bands: allow 1-step difference
+        if abs(self.energy_band - other.energy_band) > 1:
+            return False
+        if abs(self.hydration_band - other.hydration_band) > 1:
+            return False
+
+        # Hazard status must match (safety critical)
+        if self.has_hazard_nearby != other.has_hazard_nearby:
+            return False
+
+        if strict:
+            # In strict mode, also check weather and biome
+            if self.weather != other.weather or self.biome != other.biome:
+                return False
+
+        return True
+
+
+def _value_to_band(value: float) -> int:
+    """Convert a 0-1 value to a band (0=critical, 1=low, 2=ok, 3=high)."""
+    if value < 0.25:
+        return 0
+    elif value < 0.45:
+        return 1
+    elif value < 0.7:
+        return 2
+    else:
+        return 3
 
 
 class KosmosAgent:
@@ -142,6 +206,7 @@ class KosmosAgent:
         self._llm_pending: Optional[dict] = None
         self._llm_busy = False
         self._llm_pending_tick = 0
+        self._llm_request_signature: Optional[SituationSignature] = None  # Phase 1: state-validity
 
         # Event detection for 5b: event-triggered LLM calls
         self._prev_biome: Optional[str] = None
@@ -464,6 +529,7 @@ class KosmosAgent:
         self._thread.start()
         # Check LLM availability
         self.use_llm = self.llm.check_available()
+        log_llm_event("STATUS", 0, available=self.use_llm, model=self.llm.model)
 
     def stop(self):
         self._running = False
@@ -493,6 +559,37 @@ class KosmosAgent:
                 if self.world.biomes[nr, nc] == Biome.FOREST:
                     return True
         return False
+
+    def _is_hazard_nearby(self) -> bool:
+        """Check if any hazard is within radius 2."""
+        nearby = self.world.objects_near(self.pos, radius=2)
+        return any(isinstance(o, Hazard) for _, _, o in nearby)
+
+    def _compute_situation_signature(self) -> SituationSignature:
+        """
+        Compute lightweight context snapshot for state-validity checking.
+
+        This signature is compared when LLM plans arrive to determine
+        if the plan is still contextually relevant.
+        """
+        # Get current weather
+        weather_name = "clear"
+        if self.world.weather.current:
+            weather_name = self.world.weather.current.weather_type.name.lower()
+
+        # Get current biome
+        biome_name = self.world.biomes[self.pos].name.lower()
+
+        return SituationSignature(
+            zone=self._consciousness_zone,
+            energy_band=_value_to_band(self.energy),
+            hydration_band=_value_to_band(self.hydration),
+            strategy=self.strategy,
+            has_food_nearby=self._is_food_nearby(),
+            has_hazard_nearby=self._is_hazard_nearby(),
+            weather=weather_name,
+            biome=biome_name,
+        )
 
     def _build_visual_field(self, radius: int = 3) -> str:
         """
@@ -657,8 +754,8 @@ class KosmosAgent:
             self.deaths += 1
             biome_name = self.world.biomes[self.pos].name
             weather_name = self.world.weather.current.weather_type.name if self.world.weather.current else "clear"
-            print(f"[DEATH t={self.total_ticks}] pos={self.pos} biome={biome_name} weather={weather_name} "
-                  f"zone={self._consciousness_zone} hydration={self.hydration:.2f} deaths={self.deaths}")
+            log_death(self.total_ticks, self.pos, biome_name, weather_name,
+                      self._consciousness_zone, self.hydration, self.deaths)
             self._remember(f"Died of exhaustion at {self.pos}. Death #{self.deaths}.")
             self.last_action = {"tool": "death", "result": "Ran out of energy."}
 
@@ -775,6 +872,8 @@ class KosmosAgent:
             # Check for plan interrupts
             should_interrupt, interrupt_reason = self._check_plan_interrupt()
             if should_interrupt and self._current_plan:
+                log_llm_event("INTERRUPT", self.total_ticks, reason=interrupt_reason,
+                              plan_goal=self._plan_goal[:40] if self._plan_goal else "none")
                 self._current_plan.clear()
                 self._plan_goal = ""
 
@@ -782,13 +881,37 @@ class KosmosAgent:
             if self._use_planning and self._current_plan:
                 decision = self._current_plan.pop(0)
                 self._decision_source = "teacher_plan"
+                log_llm_event("EXEC", self.total_ticks, tool=decision.get('tool', '?'),
+                              remaining=len(self._current_plan))
                 # Phase 6e: Track plan completion
                 if not self._current_plan:
                     self._plans_completed += 1
+                    log_llm_event("DONE", self.total_ticks, plan_goal=self._plan_goal[:40])
             elif self._llm_pending is not None:
-                # Check if pending LLM result is a plan or single action
+                # Phase 1: State-validity checking (replaces pure tick-based staleness)
+                # Accept plan only if context still matches, with tick limit as backup
                 staleness = self.total_ticks - self._llm_pending_tick
-                if staleness <= 3:
+                current_sig = self._compute_situation_signature()
+                request_sig = self._llm_request_signature
+
+                # Determine if plan is valid: signature match + reasonable tick age
+                plan_valid = False
+                reject_reason = None
+
+                if staleness > 500:
+                    # Hard timeout - plan is too old regardless of context
+                    reject_reason = f"timeout ({staleness} ticks)"
+                elif request_sig is None:
+                    # No signature recorded (legacy case) - accept based on ticks only
+                    plan_valid = True
+                elif not current_sig.matches(request_sig):
+                    # Context has changed significantly
+                    reject_reason = f"context_mismatch (zone:{request_sig.zone}->{current_sig.zone}, strategy:{request_sig.strategy}->{current_sig.strategy})"
+                else:
+                    # Signature matches - plan is contextually relevant
+                    plan_valid = True
+
+                if plan_valid:
                     pending = self._llm_pending
                     if "plan" in pending and isinstance(pending["plan"], list):
                         # It's a plan response
@@ -797,9 +920,13 @@ class KosmosAgent:
                         self._plan_replan_if = pending.get("replan_if", [])
                         self._plan_strategy = self.strategy
                         self._plans_started += 1  # Phase 6e: Track plan start
+                        log_llm_event("ADOPT", self.total_ticks, steps=len(self._current_plan),
+                                      goal=self._plan_goal[:50])
                         if self._current_plan:
                             decision = self._current_plan.pop(0)
                             self._decision_source = "teacher_plan"
+                            log_llm_event("EXEC", self.total_ticks, tool=decision.get('tool', '?'),
+                                          remaining=len(self._current_plan))
                         else:
                             decision = self._heuristic_decide()
                             self._decision_source = "teacher_heuristic"
@@ -807,10 +934,15 @@ class KosmosAgent:
                         # Single action response (backwards compatible)
                         decision = pending
                         self._decision_source = "teacher_llm"
+                        log_llm_event("USE", self.total_ticks, tool=pending.get('tool', '?'))
                 else:
+                    # Plan rejected - log reason and fall back to heuristic
+                    log_llm_event("REJECT", self.total_ticks, reason=reject_reason)
                     decision = self._heuristic_decide()
                     self._decision_source = "teacher_heuristic"
+
                 self._llm_pending = None
+                self._llm_request_signature = None  # Clear after use
             else:
                 decision = self._heuristic_decide()
                 self._decision_source = "teacher_heuristic"
@@ -826,6 +958,10 @@ class KosmosAgent:
         need_new_plan = len(self._current_plan) <= 1  # Request plan when almost empty
         if self.use_llm and not self._llm_busy and should_fire and need_new_plan:
             self._llm_busy = True
+            # Phase 1: Capture situation signature for state-validity checking
+            self._llm_request_signature = self._compute_situation_signature()
+            log_llm_event("FIRE", self.total_ticks, reason=fire_reason,
+                          energy=f"{self.energy:.2f}", zone=self._consciousness_zone)
             categories = self._strategy_tool_categories()
             schemas = self.tools.schemas(categories)
             tick_snapshot = self.total_ticks
@@ -868,6 +1004,16 @@ class KosmosAgent:
                         result = self.llm.reason(**llm_args)
                     self._llm_pending_tick = tick_snapshot
                     self._llm_pending = result
+                    # Log LLM response
+                    if "plan" in result and isinstance(result["plan"], list):
+                        plan_summary = [step.get("tool", "?") for step in result["plan"][:4]]
+                        log_llm_event("RECV", tick_snapshot, plan=str(plan_summary),
+                                      goal=result.get('goal', '')[:40])
+                    else:
+                        log_llm_event("RECV", tick_snapshot, tool=result.get('tool', '?'),
+                                      thought=result.get('thought', '')[:50])
+                except Exception as e:
+                    log_llm_event("ERROR", tick_snapshot, error=str(e))
                 finally:
                     self._llm_busy = False
             threading.Thread(target=_llm_reason, daemon=True).start()
@@ -956,8 +1102,8 @@ class KosmosAgent:
                 # Freeze baseline at end of warmup (only once)
                 if not self._baseline_frozen:
                     self._baseline_frozen = True
-                    print(f"[Baseline frozen] death_rate={self._baseline_death_rate:.1f} "
-                          f"at samples={self._learned_samples}")
+                    get_logger().info(f"Baseline frozen: death_rate={self._baseline_death_rate:.1f} "
+                                      f"at samples={self._learned_samples}")
                 # After warmup: competence-gated decay
                 # Student is competent if:
                 # 1. Reward EMA is at least 90% of heuristic EMA
@@ -982,8 +1128,8 @@ class KosmosAgent:
                     self.action_policy, demos, learning_rate=self._bc_learning_rate
                 )
                 if self.total_ticks % 1000 == 0:
-                    print(f"[BC t={self.total_ticks}] loss={bc_stats['loss']:.3f} "
-                          f"acc={bc_stats['accuracy']:.2f} demos={len(self.demo_buffer)}")
+                    get_logger().info(f"BC t={self.total_ticks}: loss={bc_stats['loss']:.3f} "
+                                      f"acc={bc_stats['accuracy']:.2f} demos={len(self.demo_buffer)}")
 
         # Console logging every 100 ticks
         if self.total_ticks % 100 == 0:
@@ -991,8 +1137,8 @@ class KosmosAgent:
             st = self._st_metrics
             thresh = st.get('dynamic_threshold', 0.65)
             k_eff = st.get('k_effective', 2.0)
-            print(
-                f"[t={self.total_ticks}] zone={self._consciousness_zone} "
+            get_logger().info(
+                f"t={self.total_ticks} | zone={self._consciousness_zone} "
                 f"teacher_prob={self._teacher_prob:.3f} "
                 f"teacher={teacher_count} learned={self._learned_samples} "
                 f"t_ema={self._heuristic_reward_ema:.3f} l_ema={self._learned_reward_ema:.3f} "
@@ -1063,6 +1209,10 @@ class KosmosAgent:
         # 14. Phase 6e: Compute cognitive integrity periodically
         if self.total_ticks % 50 == 0:
             self._cognitive_integrity = self.surplus_tension.compute_cognitive_integrity(self)
+
+        # 15. Log metrics every 10 ticks for analysis
+        if self.total_ticks % 10 == 0:
+            log_metrics(self.total_ticks, self.get_state())
 
         self.last_action = {
             "tool": tool_name,
@@ -1382,9 +1532,9 @@ class KosmosAgent:
 
         # Log transition
         if self._is_stuck and not was_stuck:
-            print(f"[STUCK t={self.total_ticks}] Agent stuck at {unique_positions} unique positions")
+            get_logger().info(f"STUCK t={self.total_ticks}: Agent stuck at {unique_positions} unique positions")
         elif not self._is_stuck and was_stuck:
-            print(f"[UNSTUCK t={self.total_ticks}] Agent escaped stuckness")
+            get_logger().info(f"UNSTUCK t={self.total_ticks}: Agent escaped stuckness")
 
         return self._is_stuck
 
@@ -1404,8 +1554,8 @@ class KosmosAgent:
         when |σ| > threshold, the system expels accumulated tension.
         """
         k_eff = self._st_metrics.get('k_effective', 2.0)
-        print(f"[RUPTURE t={self.total_ticks}] Σ={self._st_metrics['sigma_ema']:.2f} "
-              f"k={k_eff:.1f} pos={self.pos} ruptures={self.surplus_tension.ruptures_triggered}")
+        log_rupture(self.total_ticks, self._st_metrics['sigma_ema'], k_eff,
+                    self.pos, self.surplus_tension.ruptures_triggered)
 
         # 1. Clear current plan
         self._current_plan.clear()

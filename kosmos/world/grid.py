@@ -221,16 +221,20 @@ class KosmosWorld:
                     # Respawn the resource at this node
                     self._respawn_at_node(node)
 
-        # Mature crops become food (player-planted, not node-based)
+        # Update planted crops and check for maturity
         for pos in list(self.objects.keys()):
             objs = self.objects.get(pos, [])
             for obj in list(objs):
-                if isinstance(obj, PlantedCrop) and obj.is_mature:
-                    objs.remove(obj)
-                    self._add_object(Food(position=pos), pos)
-                    self.events.append({
-                        "type": "harvest", "object": "crop", "position": pos
-                    })
+                if isinstance(obj, PlantedCrop):
+                    # Tick the crop to advance growth
+                    obj.tick()
+                    # Convert to food when mature
+                    if obj.is_mature:
+                        objs.remove(obj)
+                        self._add_object(Food(position=pos), pos)
+                        self.events.append({
+                            "type": "harvest", "object": "crop", "position": pos
+                        })
 
     def _respawn_at_node(self, node: ResourceNode):
         """Respawn a resource at a depleted node."""
